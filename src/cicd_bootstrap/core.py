@@ -388,12 +388,27 @@ def add_cd_harness(
     auto_deploy: bool = True,
     open_pr_flag: bool = True,
     allow_llm_fallback: bool = False,
+    deploy_model: str = "in-repo",
+    env: str = "dev",
+    create_missing_repo: bool = False,
 ) -> BootstrapResult:
     """Set up CD-via-Harness for a repo. Requires HARNESS_* in .env (see .env.example).
 
     ``allow_llm_fallback`` lets the LLM work out the deploy port when the repo's
     Dockerfile has no ``EXPOSE`` (for unusual apps); otherwise it defaults to 8080.
+
+    ``deploy_model="deploy-repo"`` routes to the per-app deploy-repo (GitOps) model
+    (:func:`cd_deploy_repo.add_cd_deploy_repo`); the default ``in-repo`` stores the
+    pipeline in the app repo (the body below, unchanged).
     """
+    if deploy_model == "deploy-repo":
+        from .cd_deploy_repo import add_cd_deploy_repo
+
+        return add_cd_deploy_repo(
+            repo_url, env=env, token=token, auto_deploy=auto_deploy,
+            allow_llm_fallback=allow_llm_fallback, create_missing_repo=create_missing_repo,
+        )
+
     from . import harness  # local import: Harness is optional; only needed on this path
 
     load_dotenv()

@@ -29,6 +29,9 @@ class CDRequest(BaseModel):
     open_pr: bool = True
     auto_deploy: bool = False
     allow_llm_fallback: bool = False
+    deploy_model: str = "in-repo"      # "in-repo" (default) | "deploy-repo"
+    env: str = "dev"                   # deploy-repo model: which environment
+    create_deploy_repo: bool = False   # deploy-repo model: allow creating {app}-deploy
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -38,11 +41,13 @@ def home() -> str:
 
 @app.post("/cd", response_model=BootstrapResult)
 def cd_endpoint(req: CDRequest) -> BootstrapResult:
-    # Harness only: Git-stored pipeline + webhook trigger + notify-workflow PR,
-    # deployed via the laptop delegate. No GitHub Actions deploy target.
+    # in-repo (default): Git-stored pipeline in the app repo + notify-workflow PR.
+    # deploy-repo: a per-app {app}-deploy repo holds the pipeline + per-env desired
+    # state; the agent opens a tag-bump PR there (Harness watches the deploy repo).
     return add_cd_harness(
-        req.repo_url, auto_deploy=req.auto_deploy, open_pr_flag=req.open_pr,
-        allow_llm_fallback=req.allow_llm_fallback,
+        req.repo_url, deploy_model=req.deploy_model, env=req.env,
+        auto_deploy=req.auto_deploy, open_pr_flag=req.open_pr,
+        allow_llm_fallback=req.allow_llm_fallback, create_missing_repo=req.create_deploy_repo,
     )
 
 
@@ -60,7 +65,15 @@ _BODY = f'''<span class="step">Agent 2 of 2 · CD</span>
   <button id="go" type="submit">Run CD agent</button>
 </form>
 <div class="opts">
-  <label class="chk" title="Adds a small notify-harness.yml workflow so FUTURE CI builds auto-deploy. The image already in GHCR deploys now either way."><input id="pr" type="checkbox" checked/> open the notify-harness pull request (for future auto-deploys)</label>
+  <label class="chk" title="in-repo: the Harness pipeline is stored in the app repo (current behaviour)."><input type="radio" name="model" value="in-repo" checked/> in-repo <span class="sub">(pipeline in the app repo)</span></label>
+  <label class="chk" title="deploy-repo: a separate {app}-deploy repo holds the pipeline and per-env desired state; the agent opens a tag-bump PR there and Harness watches that repo (GitOps)."><input type="radio" name="model" value="deploy-repo"/> deploy-repo <span class="sub">(separate {app}-deploy repo · GitOps)</span></label>
+</div>
+<div class="opts deploy-repo-only" style="display:none">
+  <label class="chk">environment&nbsp;<select id="env"><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
+  <label class="chk" title="The deploy-repo model needs a per-app {app}-deploy repo. Tick to let the agent CREATE it from the _deploy-template template repo if it does not exist (this creates a GitHub repository)."><input id="createrepo" type="checkbox"/> create the deploy repo if missing</label>
+</div>
+<div class="opts">
+  <label class="chk" title="Adds a small notify-harness.yml workflow so FUTURE CI builds auto-deploy. The image already in GHCR deploys now either way. (in-repo model only)"><input id="pr" type="checkbox" checked/> open the notify-harness pull request (for future auto-deploys)</label>
   <label class="chk" title="Checked: deploy straight to your laptop. Unchecked: pause for a click-to-approve in Harness (approval stage)."><input id="auto" type="checkbox"/> deploy automatically (else: click to approve in Harness)</label>
   <label class="chk" title="Deploy recipes cover the common shapes (a web service on a port; a portless background worker). If a repo fits none of them, let the LLM author a deploy recipe for it (port, health check, runtime env). The LLM is used only for authoring, never just to guess a port. Needs ANTHROPIC_API_KEY in .env."><input id="llm" type="checkbox"/> LLM authors a deploy recipe when no built-in template fits</label>
 </div>
@@ -68,16 +81,25 @@ _BODY = f'''<span class="step">Agent 2 of 2 · CD</span>
 
 _SCRIPT = '''<script>
 const f=document.getElementById('f'),out=document.getElementById('out'),go=document.getElementById('go');
+function model(){ return document.querySelector('input[name=model]:checked').value; }
+function syncModel(){ const dr=model()==='deploy-repo'; document.querySelectorAll('.deploy-repo-only').forEach(e=>e.style.display=dr?'':'none'); }
+document.querySelectorAll('input[name=model]').forEach(r=>r.addEventListener('change',syncModel)); syncModel();
 f.addEventListener('submit',async e=>{
   e.preventDefault();
   const repo_url=document.getElementById('url').value.trim();
   const open_pr=document.getElementById('pr').checked;
   const auto_deploy=document.getElementById('auto').checked;
   const allow_llm_fallback=document.getElementById('llm').checked;
+  const deploy_model=model();
+  const env=document.getElementById('env').value;
+  const create_deploy_repo=document.getElementById('createrepo').checked;
   go.disabled=true;
-  out.innerHTML='<div class="card"><span class="spin"></span>Provisioning Harness (pipeline, connector, webhook)'+(open_pr?', opening PR':'')+' &amp; deploying\\u2026</div>';
+  const busy=deploy_model==='deploy-repo'
+    ? 'Setting up the '+esc(env)+' deploy in the {app}-deploy repo (pipeline, trigger, PR)\\u2026'
+    : 'Provisioning Harness (pipeline, connector, webhook)'+(open_pr?', opening PR':'')+' &amp; deploying\\u2026';
+  out.innerHTML='<div class="card"><span class="spin"></span>'+busy+'</div>';
   try{
-    const resp=await fetch('/cd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_url,open_pr,auto_deploy,allow_llm_fallback})});
+    const resp=await fetch('/cd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_url,open_pr,auto_deploy,allow_llm_fallback,deploy_model,env,create_deploy_repo})});
     render(await resp.json());
   }catch(err){ out.innerHTML='<div class="banner err">Request failed: '+esc(String(err))+'</div>'; }
   finally{ go.disabled=false; }

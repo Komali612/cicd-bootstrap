@@ -1,0 +1,13 @@
+# Desired deploy state for this app in the `dev` environment.
+#
+# The CD agent opens a PR that sets `tag` to the image CI built. MERGING that PR is
+# the deploy signal: Harness watches this repo and, on a push to environments/**,
+# deploys the image on the laptop delegate.
+#
+# These are placeholders in the template; the CD agent overwrites this file with the
+# real app/owner/tag/port on the first deploy.
+app: APP_NAME
+env: dev
+image: ghcr.io/OWNER/APP_NAME
+tag: ""
+port: 8080
