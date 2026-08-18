@@ -28,7 +28,10 @@ cicd-bootstrap = "cicd_bootstrap.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cicd_bootstrap = ["cookbooks/cookbooks.yaml"]  # ship the shared cookbook data
+cicd_bootstrap = [
+    "cookbooks/cookbooks.yaml",        # CI cookbook data
+    "cd_cookbooks/cd_cookbooks.yaml",  # CD deploy-recipe data
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

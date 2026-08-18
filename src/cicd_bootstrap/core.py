@@ -16,8 +16,8 @@ from pathlib import Path
 from . import telemetry
 from .classify import classify
 from .config import load_dotenv, sonar_org, sonar_token
-from .contracts import BootstrapResult, ChainResult
-from .deploy import detect_port, generate_cd
+from .contracts import BootstrapResult, ChainResult, GeneratedWorkflow
+from .deploy import generate_cd
 from .generate import UnsupportedError, generate
 from .github import (
     PROpenError,
@@ -417,9 +417,27 @@ def add_cd_harness(
                 ),
             )
 
+        from .cd_author import AuthorError
+        from .cd_generate import UnsupportedDeployError
+
         try:
             provisioned = harness.deploy_via_harness(
                 snapshot, token or "", auto_deploy=auto_deploy, allow_llm_fallback=allow_llm_fallback,
+            )
+        except UnsupportedDeployError as exc:
+            # No built-in template clearly fits this repo and the fallback was off.
+            # Inform the user rather than guessing a deploy shape (mirrors CI).
+            return BootstrapResult(
+                repo_url=repo_url, status="error", kind="cd",
+                message=f"{exc} (tick 'LLM authors a deploy recipe' on the CD agent to have one written).",
+            )
+        except AuthorError as exc:
+            # The fallback was asked to author a recipe for a repo that fits no
+            # built-in template, but the LLM call couldn't produce one. Surface it
+            # rather than silently guessing.
+            return BootstrapResult(
+                repo_url=repo_url, status="error", kind="cd",
+                message=f"couldn't author a deploy recipe for this repo: {exc}",
             )
         except harness.HarnessError as exc:
             return BootstrapResult(
@@ -427,6 +445,19 @@ def add_cd_harness(
                 message=f"Harness provisioning failed: {exc}",
             )
         pid, webhook_url = provisioned["pipeline_id"], provisioned["webhook_url"]
+        recipe = provisioned["recipe"]
+
+        # Summarise what was generated (which deploy shape, LLM-authored or not) so
+        # the UI/telemetry show it exactly as they do for a CI cookbook.
+        workflow = GeneratedWorkflow(
+            path=harness.HARNESS_PIPELINE_PATH,
+            content=provisioned["pipeline_yaml"],
+            cookbook=recipe.key,
+            phases=["pull", "deploy", "health-check", "rollback"],
+            llm_authored=recipe.llm_authored,
+            llm_input_tokens=recipe.llm_input_tokens,
+            llm_output_tokens=recipe.llm_output_tokens,
+        )
 
         # Store the webhook URL as a repo secret so the notify workflow can ping it.
         try:
@@ -442,9 +473,12 @@ def add_cd_harness(
         if tag:
             try:
                 harness.trigger_deploy(webhook_url, tag)
-                port = detect_port(snapshot, allow_llm_fallback=allow_llm_fallback)
-                deploy_note = (f" Triggered a deploy of the current image (tag {tag[:7]}) on your laptop "
-                               f"delegate — it should come up at http://localhost:{port}/ shortly.")
+                if recipe.publish_port:
+                    deploy_note = (f" Triggered a deploy of the current image (tag {tag[:7]}) on your laptop "
+                                   f"delegate — it should come up at http://localhost:{recipe.port}/ shortly.")
+                else:
+                    deploy_note = (f" Triggered a deploy of the current image (tag {tag[:7]}) on your laptop "
+                                   f"delegate — the '{recipe.key}' worker should be running shortly.")
             except Exception as exc:  # non-fatal: provisioning still succeeded
                 deploy_note = f" (couldn't auto-trigger the deploy: {exc})"
 
@@ -452,7 +486,7 @@ def add_cd_harness(
         notify = harness.render_notify_workflow("CI", snapshot.default_branch)
         if not open_pr_flag:
             return BootstrapResult(
-                repo_url=repo_url, status="generated", kind="cd", cd_gate=gate,
+                repo_url=repo_url, status="generated", kind="cd", cd_gate=gate, workflow=workflow,
                 message=f"Harness pipeline '{pid}' created (stored in the repo as {harness.HARNESS_PIPELINE_PATH}).{deploy_note}",
             )
 
@@ -466,10 +500,11 @@ def add_cd_harness(
                 commit_message="cd: ping Harness to deploy after CI (Harness CD)",
             )
         except PROpenError as exc:
-            return BootstrapResult(repo_url=repo_url, status="error", kind="cd", cd_gate=gate, message=str(exc))
+            return BootstrapResult(repo_url=repo_url, status="error", kind="cd", cd_gate=gate,
+                                   workflow=workflow, message=str(exc))
 
         return BootstrapResult(
-            repo_url=repo_url, status="opened", kind="cd", cd_gate=gate,
+            repo_url=repo_url, status="opened", kind="cd", cd_gate=gate, workflow=workflow,
             branch=branch, pr_number=pr_number, pr_url=pr_url,
             message=(
                 f"opened PR #{pr_number} — Harness pipeline '{pid}' is stored in the repo "

@@ -88,6 +88,44 @@ a best-effort guess that should be reviewed.
 The result is flagged `llm_authored: true` and the PR/UI shows a review warning.
 Needs `ANTHROPIC_API_KEY`.
 
+## CD deploy recipes + LLM fallback (the same pattern, for delivery)
+
+CD mirrors CI. Where a CI cookbook varies by *language*, a CD **deploy recipe**
+varies by *deploy shape* — because a built container runs the same regardless of
+language, what actually differs is how you run it. The repo is matched to a shape
+by a deterministic heuristic over the Dockerfile:
+
+| Built-in recipe | For | Effect |
+|-----------------|-----|--------|
+| `web-service` | an HTTP server (has `EXPOSE`) | publishes the port, HTTP health-check, rollback |
+| `worker` | a portless background/queue/cron process | **no** published port, health-check = the container stays running, rollback |
+
+A repo that clearly fits a built-in shape deploys deterministically — **no LLM
+call at all**. "Clearly fits" is generous: a single `EXPOSE` is a web service, a
+worker command is a worker, and a plain container with **neither** is still a web
+service on 8080 (the common case). A repo is only **unclear** when its Dockerfile
+signals genuinely conflict — a port *and* a worker command, or several ports with
+no way to pick one.
+
+The LLM is a strict fallback for those unclear repos: it runs **only** when the
+repo doesn't clearly fit a built-in template **and** the fallback is enabled —
+first to recognise the unusual shape, then to author *just the recipe fields*
+(`cd_author.py`) for it (runtime env, a non-`/` health path, a custom run
+command…). Whatever the LLM supplies slots into the **same fixed deploy strategy**
+(pull → recreate → health-check → rollback); the LLM never writes the Harness
+pipeline YAML. If a repo is unclear and the fallback is **off**, CD does not guess
+— it reports *"no built-in deploy template matches this repo — enable the LLM
+fallback"* (mirroring how CI reports an unsupported stack). Recipes live as data
+in `src/cicd_bootstrap/cd_cookbooks/cd_cookbooks.yaml` — add a shape by adding one
+entry.
+
+- **CD agent UI:** tick *"LLM authors a deploy recipe when no built-in template fits"*.
+- **API:** `POST /cd {"repo_url": "...", "allow_llm_fallback": true}`
+
+Off by default, flagged `llm_authored: true` with a review warning, and needs
+`ANTHROPIC_API_KEY`. The LLM is used **only** to author a missing recipe — never
+merely to guess a port for a shape we already support.
+
 ## Telemetry & dashboard
 
 Every bootstrap appends one event (classification method/confidence, tokens,

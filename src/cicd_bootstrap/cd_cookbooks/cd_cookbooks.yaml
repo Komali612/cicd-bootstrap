@@ -1,0 +1,27 @@
+# Built-in CD deploy recipes (the CD counterpart to cookbooks.yaml).
+#
+# A CI cookbook varies by language/build system; a CD recipe varies by DEPLOY
+# SHAPE -- because a built container runs the same regardless of the source
+# language, what actually differs between apps is HOW you run it: whether it
+# publishes a network port, how you health-check it, and any runtime env.
+#
+# The deploy STRATEGY (pull the image, recreate the container, health-check, roll
+# back on failure) is fixed in the generator; a recipe only supplies the fields
+# below. Shapes with no recipe here are authored by the LLM (see cd_author.py).
+#
+# To add a built-in shape, add one entry under `recipes:` -- nothing else changes.
+recipes:
+  web-service:
+    display_name: "Web service (HTTP server on a port)"
+    publish_port: true          # docker run -p PORT:PORT
+    port: 8080                  # default; the real port comes from the Dockerfile EXPOSE
+    health_type: http           # health-check by curling the published port
+    health_path: "/"
+    env: []
+
+  worker:
+    display_name: "Background worker (no network port)"
+    publish_port: false         # no -p: a queue consumer / cron / batch process
+    port: 8080                  # unused (kept for a uniform shape)
+    health_type: process        # health-check = the container stays running
+    env: []

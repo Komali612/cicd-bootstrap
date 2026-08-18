@@ -9,8 +9,8 @@ output**. This is the single seam for the model:
 * mock here in tests.
 
 Everything else in the tool stays deterministic (git, GitHub/Harness APIs, YAML).
-Only three callers use this: classification fallback, cookbook authoring, and CD
-port detection.
+Callers: CI classification fallback and cookbook authoring, and their CD twins --
+deploy-shape classification and deploy-recipe authoring.
 """
 
 from __future__ import annotations

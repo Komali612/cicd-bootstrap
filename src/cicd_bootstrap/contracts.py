@@ -58,6 +58,61 @@ class LLMCookbook(BaseModel):
     dockerfile: str = Field(description="A minimal, stack-appropriate multi-stage Dockerfile")
 
 
+class LLMDeployShape(BaseModel):
+    """Structured output for the CD deploy-shape classifier (the CD twin of
+    :class:`LLMClassification`)."""
+
+    kind: str = Field(
+        description="How the container is run: 'web-service' if it listens on a "
+        "network port (HTTP/gRPC server), 'worker' if it's a background process "
+        "with no inbound port (queue consumer, cron, batch). If it fits neither "
+        "cleanly (needs specific env to boot, a non-'/' health endpoint, multiple "
+        "ports, or a custom run command), return a short kebab-case label naming "
+        "the unusual shape instead."
+    )
+    port: int | None = Field(default=None, description="Port a web service listens on; null for a worker")
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: list[str] = Field(description="Files/facts that justify the shape")
+
+
+class DeployShape(BaseModel):
+    """Handoff contract: cd_classify -> cd_generate (the CD twin of :class:`Classification`)."""
+
+    kind: str          # the key the deploy-recipe registry is keyed on
+    port: int | None = None
+    confidence: float
+    method: str        # "llm" | "heuristic"
+    evidence: list[str] = []
+    llm_input_tokens: int | None = None
+    llm_output_tokens: int | None = None
+
+
+class LLMDeployRecipe(BaseModel):
+    """Structured output for the CD LLM fallback: ONLY the fields a deploy recipe
+    varies. The LLM never writes the pipeline YAML; the fixed deploy strategy
+    (pull/recreate/health-check/rollback) is assembled around these fields."""
+
+    publish_port: bool = Field(
+        description="True if the app listens on a network port that must be published; "
+        "False for a background worker with no inbound port."
+    )
+    port: int = Field(description="The TCP port to publish and health-check when publish_port is true (else ignored)")
+    health_type: str = Field(
+        description="'http' to health-check by curling the port, or 'process' to only "
+        "require that the container keeps running (for workers)."
+    )
+    health_path: str = Field(default="/", description="For an http health check, the URL path to hit, e.g. '/health'")
+    env: list[str] = Field(
+        default_factory=list,
+        description="Runtime environment variables the container needs to start/serve, each 'NAME=VALUE'.",
+    )
+    run_command: list[str] = Field(
+        default_factory=list,
+        description="Optional command to run the container with; leave empty to use the image's default CMD.",
+    )
+    reasoning: str = Field(default="", description="One sentence on how you determined this")
+
+
 class Classification(BaseModel):
     """Handoff contract: classify -> generate."""
 
