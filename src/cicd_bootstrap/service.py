@@ -30,7 +30,7 @@ class CDRequest(BaseModel):
     repo_url: str
     open_pr: bool = True
     auto_deploy: bool = False  # True: deploy straight to prod; False: pause for approval
-    allow_llm_fallback: bool = False  # let the LLM work out the port if the Dockerfile has none
+    allow_llm_fallback: bool = False  # CD: if no built-in deploy recipe matches the shape, let the LLM author one
 
 
 class SetupRequest(BaseModel):

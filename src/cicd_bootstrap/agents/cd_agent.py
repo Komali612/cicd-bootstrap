@@ -62,7 +62,7 @@ _BODY = f'''<span class="step">Agent 2 of 2 · CD</span>
 <div class="opts">
   <label class="chk" title="Adds a small notify-harness.yml workflow so FUTURE CI builds auto-deploy. The image already in GHCR deploys now either way."><input id="pr" type="checkbox" checked/> open the notify-harness pull request (for future auto-deploys)</label>
   <label class="chk" title="Checked: deploy straight to your laptop. Unchecked: pause for a click-to-approve in Harness (approval stage)."><input id="auto" type="checkbox"/> deploy automatically (else: click to approve in Harness)</label>
-  <label class="chk" title="If the Dockerfile has no EXPOSE line, let the LLM work out which port the app listens on (from the Dockerfile/README/source). Needs ANTHROPIC_API_KEY in .env."><input id="llm" type="checkbox"/> LLM assist: figure out the port when the Dockerfile doesn't say</label>
+  <label class="chk" title="Deploy recipes cover the common shapes (a web service on a port; a portless background worker). If a repo fits none of them, let the LLM author a deploy recipe for it (port, health check, runtime env). The LLM is used only for authoring, never just to guess a port. Needs ANTHROPIC_API_KEY in .env."><input id="llm" type="checkbox"/> LLM authors a deploy recipe when no built-in template fits</label>
 </div>
 <div id="out"></div>'''
 

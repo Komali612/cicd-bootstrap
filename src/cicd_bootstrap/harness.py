@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import time
 
 import httpx
 import yaml
 
 from .config import load_dotenv
-from .deploy import detect_port
+from .cd_cookbooks import HEALTH_HTTP, DeployRecipe
 from .contracts import RepoSnapshot
 
 # Where the pipeline lives when stored in the repo (Git Experience / "remote").
@@ -94,67 +95,108 @@ def identifier(name: str) -> str:
 
 # --- pipeline generation --------------------------------------------------
 
-def build_deploy_script(owner: str, name: str, port: int) -> str:
+def _health_block(recipe: DeployRecipe) -> str:
+    """The health-check loop for the deploy script, per the recipe's health type.
+
+    * ``http``    -> the container must be running AND the port must answer.
+    * ``process`` -> no port to probe; the container just has to stay running.
+    The delegate is a separate container, so an http check reaches the app on the
+    HOST via ``host.docker.internal`` rather than its own ``localhost``.
+    """
+    if recipe.health_type == HEALTH_HTTP:
+        path = recipe.health_path or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return (
+            'healthy=""; code="000"\n'
+            'for i in $(seq 1 15); do\n'
+            "  running=\"$(docker inspect --format '{{.State.Running}}' \"$APP\" 2>/dev/null || echo false)\"\n"
+            '  if [ "$running" = "true" ]; then\n'
+            f"    code=\"$(curl -s -o /dev/null -w '%{{http_code}}' \"http://host.docker.internal:$PORT{path}\" 2>/dev/null || echo 000)\"\n"
+            '    if [ "$code" != "000" ]; then healthy="yes"; break; fi\n'
+            '  fi\n'
+            '  sleep 2\n'
+            'done\n'
+        )
+    return (
+        '# No published port: health = the worker container stays running for ~10s.\n'
+        'healthy=""\n'
+        'for i in $(seq 1 5); do\n'
+        "  running=\"$(docker inspect --format '{{.State.Running}}' \"$APP\" 2>/dev/null || echo false)\"\n"
+        '  if [ "$running" != "true" ]; then healthy=""; break; fi\n'
+        '  healthy="yes"; sleep 2\n'
+        'done\n'
+    )
+
+
+def build_deploy_script(owner: str, name: str, recipe: DeployRecipe) -> str:
     """The recreate-with-rollback deploy step the delegate runs (drives host Docker).
 
-    Mirrors :func:`cicd_bootstrap.deploy._deploy_script`, with two delegate-specific
-    changes: the image tag comes from a pipeline variable ``imageTag``, and the
-    health check hits ``host.docker.internal`` (the delegate is a separate
-    container, so its own ``localhost`` can't reach the app published on the host).
+    Driven by a :class:`DeployRecipe`: a ``web-service`` publishes its port and is
+    health-checked over HTTP; a ``worker`` publishes no port and is healthy as long
+    as the container keeps running. Runtime env and an optional run command come
+    from the recipe too. The image tag comes from the pipeline variable ``imageTag``.
     """
     image = f"ghcr.io/{owner.lower()}/{name.lower()}"
     app = name.lower()
-    return f"""\
-set +e
-TAG="<+pipeline.variables.imageTag>"
-IMAGE="{image}:$TAG"
-APP="{app}"
-PORT="{port}"
-echo "Deploying $IMAGE  ->  container '$APP' on port $PORT"
+    port = recipe.port
 
-# Remember the currently-running image so we can roll back to it if needed.
-PREV="$(docker inspect --format '{{{{.Config.Image}}}}' "$APP" 2>/dev/null || true)"
-echo "Currently running image: ${{PREV:-<none>}}"
+    publish = f"-p {port}:{port} " if recipe.publish_port else ""
+    env_flags = "".join(f"-e {shlex.quote(f'{n}={v}')} " for n, v in recipe.env)
+    cmd_suffix = "".join(f" {shlex.quote(c)}" for c in recipe.run_command)
+    run_new = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$IMAGE"{cmd_suffix}'
+    run_prev = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$PREV"{cmd_suffix}'
 
-if ! docker pull "$IMAGE"; then
-  echo "Could not pull $IMAGE -- leaving the current deployment untouched."
-  exit 1
-fi
+    port_line = f'PORT="{port}"\n' if recipe.publish_port else ""
+    where = " on port $PORT" if recipe.publish_port else " (no published port)"
+    success = (
+        "Deploy successful -- '$APP' is up and answering (HTTP $code)."
+        if recipe.health_type == HEALTH_HTTP
+        else "Deploy successful -- '$APP' is up and staying running."
+    )
 
-docker rm -f "$APP" >/dev/null 2>&1 || true
-docker run -d --name "$APP" --restart unless-stopped -p "$PORT:$PORT" "$IMAGE"
+    return (
+        "set +e\n"
+        'TAG="<+pipeline.variables.imageTag>"\n'
+        f'IMAGE="{image}:$TAG"\n'
+        f'APP="{app}"\n'
+        f"{port_line}"
+        f"echo \"Deploying $IMAGE  ->  container '$APP'{where}\"\n"
+        "\n"
+        "# Remember the currently-running image so we can roll back to it if needed.\n"
+        "PREV=\"$(docker inspect --format '{{.Config.Image}}' \"$APP\" 2>/dev/null || true)\"\n"
+        'echo "Currently running image: ${PREV:-<none>}"\n'
+        "\n"
+        'if ! docker pull "$IMAGE"; then\n'
+        '  echo "Could not pull $IMAGE -- leaving the current deployment untouched."\n'
+        "  exit 1\n"
+        "fi\n"
+        "\n"
+        'docker rm -f "$APP" >/dev/null 2>&1 || true\n'
+        f"{run_new}\n"
+        "\n"
+        f"{_health_block(recipe)}"
+        "\n"
+        'if [ -n "$healthy" ]; then\n'
+        f'  echo "{success}"\n'
+        "  exit 0\n"
+        "fi\n"
+        "\n"
+        'echo "New container failed its health check. Recent logs:"\n'
+        'docker logs --tail 50 "$APP" 2>&1 || true\n'
+        'if [ -n "$PREV" ] && [ "$PREV" != "$IMAGE" ]; then\n'
+        '  echo "Rolling back to previous image: $PREV"\n'
+        '  docker rm -f "$APP" >/dev/null 2>&1 || true\n'
+        f"  {run_prev}\n"
+        '  echo "Rolled back to $PREV."\n'
+        "else\n"
+        '  echo "No previous image to roll back to (first deploy?)."\n'
+        "fi\n"
+        "exit 1\n"
+    )
 
-# Health check from the delegate: reach the app on the HOST via host.docker.internal.
-healthy=""; code="000"
-for i in $(seq 1 15); do
-  running="$(docker inspect --format '{{{{.State.Running}}}}' "$APP" 2>/dev/null || echo false)"
-  if [ "$running" = "true" ]; then
-    code="$(curl -s -o /dev/null -w '%{{http_code}}' "http://host.docker.internal:$PORT/" 2>/dev/null || echo 000)"
-    if [ "$code" != "000" ]; then healthy="yes"; break; fi
-  fi
-  sleep 2
-done
 
-if [ -n "$healthy" ]; then
-  echo "Deploy successful -- '$APP' is up and answering (HTTP $code)."
-  exit 0
-fi
-
-echo "New container failed its health check. Recent logs:"
-docker logs --tail 50 "$APP" 2>&1 || true
-if [ -n "$PREV" ] && [ "$PREV" != "$IMAGE" ]; then
-  echo "Rolling back to previous image: $PREV"
-  docker rm -f "$APP" >/dev/null 2>&1 || true
-  docker run -d --name "$APP" --restart unless-stopped -p "$PORT:$PORT" "$PREV"
-  echo "Rolled back to $PREV."
-else
-  echo "No previous image to roll back to (first deploy?)."
-fi
-exit 1
-"""
-
-
-def _deploy_stage(owner: str, name: str, port: int) -> dict:
+def _deploy_stage(owner: str, name: str, recipe: DeployRecipe) -> dict:
     return {
         "stage": {
             "name": "Deploy",
@@ -175,7 +217,7 @@ def _deploy_stage(owner: str, name: str, port: int) -> dict:
                                     "delegateSelectors": [DELEGATE_SELECTOR],
                                     "source": {
                                         "type": "Inline",
-                                        "spec": {"script": build_deploy_script(owner, name, port)},
+                                        "spec": {"script": build_deploy_script(owner, name, recipe)},
                                     },
                                     "environmentVariables": [],
                                     "outputVariables": [],
@@ -226,12 +268,12 @@ def _approval_stage() -> dict:
     }
 
 
-def build_pipeline(owner: str, name: str, port: int, *, auto_deploy: bool, org: str, project: str) -> dict:
+def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: bool, org: str, project: str) -> dict:
     """The Harness pipeline dict: (optional approval ->) deploy on the laptop delegate."""
     stages: list[dict] = []
     if not auto_deploy:
         stages.append(_approval_stage())
-    stages.append(_deploy_stage(owner, name, port))
+    stages.append(_deploy_stage(owner, name, recipe))
     return {
         "pipeline": {
             "name": f"Deploy {name}",
@@ -249,12 +291,17 @@ def build_pipeline(owner: str, name: str, port: int, *, auto_deploy: bool, org: 
     }
 
 
-def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True, port: int | None = None,
-                        allow_llm_fallback: bool = False) -> str:
+def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
+                        recipe: DeployRecipe | None = None, allow_llm_fallback: bool = False) -> str:
     cfg = HarnessConfig()
-    port = port or detect_port(snapshot, allow_llm_fallback=allow_llm_fallback)
+    if recipe is None:
+        # Resolve the deploy recipe (built-in shape, or LLM-authored when none
+        # matches). Imported lazily to avoid an import cycle at module load.
+        from .cd_generate import resolve_recipe
+
+        recipe = resolve_recipe(snapshot, allow_llm_fallback=allow_llm_fallback)
     pipe = build_pipeline(
-        snapshot.owner, snapshot.name, port,
+        snapshot.owner, snapshot.name, recipe,
         auto_deploy=auto_deploy, org=cfg.org, project=cfg.project,
     )
     return yaml.dump(pipe, sort_keys=False, default_flow_style=False, width=4096)
@@ -438,16 +485,18 @@ def create_pipeline_remote(
 def store_pipeline_in_repo(
     snapshot: RepoSnapshot, github_token: str, *,
     auto_deploy: bool = True, branch: str | None = None, cfg: HarnessConfig | None = None,
-    allow_llm_fallback: bool = False,
+    allow_llm_fallback: bool = False, pipeline_yaml: str | None = None,
 ) -> str:
     """One call: ensure the token secret + GitHub connector, then create the deploy
     pipeline as a Git-stored file in the repo (Harness commits ``.harness/deploy.yaml``).
-    Returns the pipeline identifier."""
+    Returns the pipeline identifier. Pass ``pipeline_yaml`` to reuse an already-built
+    pipeline (so the recipe is resolved once); otherwise it is built here."""
     cfg = (cfg or HarnessConfig()).require()
     branch = branch or snapshot.default_branch
     token_ref = ensure_secret_text(TOKEN_SECRET_NAME, github_token, cfg)
     connector = ensure_github_connector(snapshot.owner, cfg, token_ref=token_ref, validation_repo=snapshot.name)
-    pipeline_yaml = build_pipeline_yaml(snapshot, auto_deploy=auto_deploy, allow_llm_fallback=allow_llm_fallback)
+    if pipeline_yaml is None:
+        pipeline_yaml = build_pipeline_yaml(snapshot, auto_deploy=auto_deploy, allow_llm_fallback=allow_llm_fallback)
     pid = identifier(f"deploy_{snapshot.name}")
     return create_pipeline_remote(
         pipeline_yaml, pid, connector_ref=connector, repo=snapshot.name, branch=branch, cfg=cfg,
@@ -556,11 +605,18 @@ def deploy_via_harness(
 ) -> dict[str, str]:
     """Full Harness CD provisioning for a repo: secret + GitHub connector + the
     Git-stored deploy pipeline + the CI-notify webhook trigger. Returns
-    ``{"pipeline_id", "webhook_url"}``. Caller stores the URL as a repo secret and
-    opens a PR adding the notify workflow (see core.add_cd_harness)."""
+    ``{"pipeline_id", "webhook_url", "recipe", "pipeline_yaml"}``. Caller stores the
+    URL as a repo secret and opens a PR adding the notify workflow (see
+    core.add_cd_harness); ``recipe``/``pipeline_yaml`` let it report what was
+    generated (which deploy shape, and whether the recipe was LLM-authored)."""
     cfg = (cfg or HarnessConfig()).require()
     branch = branch or snapshot.default_branch
+    # Resolve the deploy recipe once so we can both provision it and report it.
+    from .cd_generate import resolve_recipe
+
+    recipe = resolve_recipe(snapshot, allow_llm_fallback=allow_llm_fallback)
+    pipeline_yaml = build_pipeline_yaml(snapshot, auto_deploy=auto_deploy, recipe=recipe)
     pid = store_pipeline_in_repo(snapshot, github_token, auto_deploy=auto_deploy, branch=branch, cfg=cfg,
-                                 allow_llm_fallback=allow_llm_fallback)
+                                 pipeline_yaml=pipeline_yaml)
     webhook_url = ensure_webhook_trigger(pid, cfg, branch=branch)
-    return {"pipeline_id": pid, "webhook_url": webhook_url}
+    return {"pipeline_id": pid, "webhook_url": webhook_url, "recipe": recipe, "pipeline_yaml": pipeline_yaml}
