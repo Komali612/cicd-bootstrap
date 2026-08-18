@@ -153,7 +153,7 @@ def add_cd_deploy_repo(
         # then have Harness watch the deploy repo.
         try:
             pipeline_yaml = harness.build_pipeline_yaml(
-                snapshot, auto_deploy=auto_deploy, recipe=recipe, env=env,
+                snapshot, auto_deploy=auto_deploy, recipe=recipe, env=env, deploy_repo=deploy_repo,
             )
             pid = harness.store_pipeline_in_repo(
                 snapshot, token, auto_deploy=auto_deploy, branch=DEPLOY_BRANCH,

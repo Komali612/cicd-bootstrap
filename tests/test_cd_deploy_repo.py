@@ -65,11 +65,35 @@ def _patch(monkeypatch, *, exists: bool, image: bool = True) -> _Calls:
 
 # --- pure pipeline shape (no mocks) -----------------------------------------
 
+def _deploy_script(p):
+    return p["pipeline"]["stages"][0]["stage"]["spec"]["execution"]["steps"][0]["step"]["spec"]["source"]["spec"]["script"]
+
+
+def _deploy_step(p):
+    return p["pipeline"]["stages"][0]["stage"]["spec"]["execution"]["steps"][0]["step"]["spec"]
+
+
+def test_gitops_pipeline_reads_tag_from_env_file():
+    p = build_pipeline("Owner", "app", _recipe(), auto_deploy=True, org="default", project="p",
+                       env="dev", deploy_repo="app-deploy")
+    # GitOps: only `env` is an input -- the tag is read from the env file, not passed in.
+    assert [v["name"] for v in p["pipeline"]["variables"]] == ["env"]
+    script = _deploy_script(p)
+    assert 'APP="app-<+pipeline.variables.env>"' in script            # env-scoped container
+    assert "environments/$ENV.yaml" in script                         # reads the desired-state file
+    assert "$GH_TOKEN" in script                                      # via the injected secret
+    assert 'DEPLOY_REPO="Owner/app-deploy"' in script                 # points at the deploy repo
+    assert "api.github.com/repos/$DEPLOY_REPO/contents/environments/$ENV.yaml" in script
+    # the token is injected as a masked secret env var
+    ev = _deploy_step(p)["environmentVariables"]
+    assert ev == [{"name": "GH_TOKEN", "type": "Secret", "value": "cicd_github_token"}]
+
+
 def test_env_scoped_pipeline_adds_env_input_and_scopes_container():
+    # env set, but no deploy_repo -> env-scoped container yet still an imageTag input.
     p = build_pipeline("Owner", "app", _recipe(), auto_deploy=True, org="default", project="p", env="dev")
     assert [v["name"] for v in p["pipeline"]["variables"]] == ["imageTag", "env"]
-    script = p["pipeline"]["stages"][0]["stage"]["spec"]["execution"]["steps"][0]["step"]["spec"]["source"]["spec"]["script"]
-    assert 'APP="app-<+pipeline.variables.env>"' in script
+    assert 'APP="app-<+pipeline.variables.env>"' in _deploy_script(p)
 
 
 def test_in_repo_pipeline_unchanged_when_env_none():

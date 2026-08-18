@@ -129,7 +129,22 @@ def _health_block(recipe: DeployRecipe) -> str:
     )
 
 
-def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False) -> str:
+def _gitops_tag_line(owner: str, deploy_repo: str) -> str:
+    """Shell that resolves TAG from the deploy repo's environments/<env>.yaml (the
+    source of truth) instead of taking it as a pipeline input. GH_TOKEN is injected as
+    a masked secret env var by the deploy stage; the delegate needs curl + network
+    egress to api.github.com."""
+    return f'''ENV="<+pipeline.variables.env>"
+DEPLOY_REPO="{owner}/{deploy_repo}"
+echo "Resolving image tag from $DEPLOY_REPO (environments/$ENV.yaml)"
+DESIRED="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$DEPLOY_REPO/contents/environments/$ENV.yaml")"
+TAG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^tag:[[:space:]]*//p' | tr -d '"' | head -n1)"
+if [ -z "$TAG" ]; then echo "No tag found in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
+echo "Desired tag: $TAG"
+'''
+
+
+def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False, deploy_repo: str | None = None) -> str:
     """The recreate-with-rollback deploy step the delegate runs (drives host Docker).
 
     Driven by a :class:`DeployRecipe`: a ``web-service`` publishes its port and is
@@ -158,9 +173,12 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
         else "Deploy successful -- '$APP' is up and staying running."
     )
 
+    # GitOps (deploy_repo): read the tag from environments/<env>.yaml. Otherwise the
+    # tag is the pipeline's imageTag input (the in-repo model, unchanged).
+    tag_line = _gitops_tag_line(owner, deploy_repo) if deploy_repo else 'TAG="<+pipeline.variables.imageTag>"\n'
     return (
         "set +e\n"
-        'TAG="<+pipeline.variables.imageTag>"\n'
+        f"{tag_line}"
         f'IMAGE="{image}:$TAG"\n'
         f'APP="{app}"\n'
         f"{port_line}"
@@ -199,7 +217,12 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
     )
 
 
-def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False) -> dict:
+def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False,
+                  deploy_repo: str | None = None) -> dict:
+    # GitOps: inject the GitHub token as a masked secret env var so the deploy script
+    # can read environments/<env>.yaml from the deploy repo.
+    env_vars = ([{"name": "GH_TOKEN", "type": "Secret", "value": identifier(TOKEN_SECRET_NAME)}]
+                if deploy_repo else [])
     return {
         "stage": {
             "name": "Deploy",
@@ -220,9 +243,9 @@ def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bo
                                     "delegateSelectors": [DELEGATE_SELECTOR],
                                     "source": {
                                         "type": "Inline",
-                                        "spec": {"script": build_deploy_script(owner, name, recipe, env_scoped=env_scoped)},
+                                        "spec": {"script": build_deploy_script(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo)},
                                     },
-                                    "environmentVariables": [],
+                                    "environmentVariables": env_vars,
                                     "outputVariables": [],
                                 },
                             }
@@ -272,28 +295,41 @@ def _approval_stage() -> dict:
 
 
 def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: bool, org: str, project: str,
-                   env: str | None = None) -> dict:
+                   env: str | None = None, deploy_repo: str | None = None) -> dict:
     """The Harness pipeline dict: (optional approval ->) deploy on the laptop delegate.
 
-    When ``env`` is given (the deploy-repo / GitOps model) the pipeline gains an
-    ``env`` input and the deployed container is env-scoped (``{app}-{env}``) so
-    dev/staging/prod can coexist on the one delegate. ``env=None`` reproduces the
-    original in-repo pipeline byte-for-byte."""
+    Three shapes:
+
+    * ``env=None`` (default) -> the in-repo pipeline, byte-for-byte unchanged:
+      ``imageTag`` is the only input.
+    * ``deploy_repo`` set (the deploy-repo / GitOps model) -> the container is
+      env-scoped (``{app}-{env}``) and the image tag is read at run time from the
+      deploy repo's ``environments/<env>.yaml``, so only ``env`` is an input.
+    * ``env`` set without ``deploy_repo`` -> env-scoped container but the tag is still
+      an ``imageTag`` input (a stepping stone; not used by the agent)."""
     env_scoped = env is not None
+    gitops = deploy_repo is not None
     stages: list[dict] = []
     if not auto_deploy:
         stages.append(_approval_stage())
-    stages.append(_deploy_stage(owner, name, recipe, env_scoped=env_scoped))
-    # imageTag is supplied at run time (by a person, or by the CI artifact / GitOps trigger).
-    variables: list[dict] = [
-        {"name": "imageTag", "type": "String", "description": "GHCR image tag (the CI commit SHA)",
-         "required": True, "value": "<+input>"}
-    ]
-    if env_scoped:
-        variables.append(
+    stages.append(_deploy_stage(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo))
+    if gitops:
+        # GitOps: the tag is read from environments/<env>.yaml at run time, so the only
+        # pipeline input is which environment to deploy.
+        variables: list[dict] = [
             {"name": "env", "type": "String", "description": "target environment (dev/staging/prod)",
              "required": True, "value": "<+input>"}
-        )
+        ]
+    else:
+        variables = [
+            {"name": "imageTag", "type": "String", "description": "GHCR image tag (the CI commit SHA)",
+             "required": True, "value": "<+input>"}
+        ]
+        if env_scoped:
+            variables.append(
+                {"name": "env", "type": "String", "description": "target environment (dev/staging/prod)",
+                 "required": True, "value": "<+input>"}
+            )
     return {
         "pipeline": {
             "name": f"Deploy {name}",
@@ -309,7 +345,7 @@ def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: 
 
 def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
                         recipe: DeployRecipe | None = None, allow_llm_fallback: bool = False,
-                        env: str | None = None) -> str:
+                        env: str | None = None, deploy_repo: str | None = None) -> str:
     cfg = HarnessConfig()
     if recipe is None:
         # Resolve the deploy recipe (built-in shape, or LLM-authored when none
@@ -319,7 +355,7 @@ def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
         recipe = resolve_recipe(snapshot, allow_llm_fallback=allow_llm_fallback)
     pipe = build_pipeline(
         snapshot.owner, snapshot.name, recipe,
-        auto_deploy=auto_deploy, org=cfg.org, project=cfg.project, env=env,
+        auto_deploy=auto_deploy, org=cfg.org, project=cfg.project, env=env, deploy_repo=deploy_repo,
     )
     return yaml.dump(pipe, sort_keys=False, default_flow_style=False, width=4096)
 
@@ -660,14 +696,13 @@ def ensure_git_trigger(
     """Create (or update) a GitHub *push* trigger on ``repo`` that runs ``pipeline_id``
     when files under ``environments/**`` change. Idempotent; returns the trigger id.
 
-    NOTE (Phase 2): ``imageTag`` is provisionally mapped from the push payload; the
-    final wiring reads the tag from the changed ``environments/<env>.yaml`` (the deploy
-    repo is the source of truth). See the plan -- this is the piece proven live in Phase 2."""
+    The pipeline reads the image tag from ``environments/<env>.yaml`` itself (the deploy
+    repo is the source of truth), so the trigger only needs to supply which ``env`` to
+    deploy."""
     cfg = (cfg or HarnessConfig()).require()
     trigger_id = f"{GITOPS_TRIGGER_PREFIX}_{identifier(pipeline_id)}"
     input_yaml = yaml.dump(
         {"pipeline": {"identifier": pipeline_id, "variables": [
-            {"name": "imageTag", "type": "String", "value": "<+trigger.payload.after>"},
             {"name": "env", "type": "String", "value": env},
         ]}},
         sort_keys=False,
