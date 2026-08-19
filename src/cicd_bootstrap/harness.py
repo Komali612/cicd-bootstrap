@@ -143,6 +143,7 @@ echo "Resolving desired state from $DEPLOY_REPO (environments/$ENV.yaml)"
 DESIRED="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$DEPLOY_REPO/contents/environments/$ENV.yaml")"
 IMG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^image:[[:space:]]*//p' | tr -d '"' | head -n1)"
 TAG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^tag:[[:space:]]*//p' | tr -d '"' | head -n1)"
+ROLLBACK="$(printf '%s\\n' "$DESIRED" | sed -n 's/^rollback_image:[[:space:]]*//p' | tr -d '"' | head -n1)"
 {port_read}if [ -z "$TAG" ] || [ -z "$IMG" ]; then echo "Missing image/tag in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
 echo "Desired image: $IMG:$TAG"
 '''
@@ -183,7 +184,7 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
         where = " on port $PORT" if recipe.publish_port else " (no published port)"
 
     run_new = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$IMAGE"{cmd_suffix}'
-    run_prev = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$PREV"{cmd_suffix}'
+    run_prev = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$ROLLBACK_TARGET"{cmd_suffix}'
     success = (
         "Deploy successful -- '$APP' is up and answering (HTTP $code)."
         if recipe.health_type == HEALTH_HTTP
@@ -200,6 +201,9 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
         "# Remember the currently-running image so we can roll back to it if needed.\n"
         "PREV=\"$(docker inspect --format '{{.Config.Image}}' \"$APP\" 2>/dev/null || true)\"\n"
         'echo "Currently running image: ${PREV:-<none>}"\n'
+        "# Rollback target: an explicit rollback_image from the values file (if any),\n"
+        "# else the currently-running image (the last known-good build).\n"
+        'ROLLBACK_TARGET="${ROLLBACK:-$PREV}"\n'
         "\n"
         'if ! docker pull "$IMAGE"; then\n'
         '  echo "Could not pull $IMAGE -- leaving the current deployment untouched."\n'
@@ -218,13 +222,14 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
         "\n"
         'echo "New container failed its health check. Recent logs:"\n'
         'docker logs --tail 50 "$APP" 2>&1 || true\n'
-        'if [ -n "$PREV" ] && [ "$PREV" != "$IMAGE" ]; then\n'
-        '  echo "Rolling back to previous image: $PREV"\n'
+        'if [ -n "$ROLLBACK_TARGET" ] && [ "$ROLLBACK_TARGET" != "$IMAGE" ]; then\n'
+        '  echo "Rolling back to: $ROLLBACK_TARGET"\n'
+        '  docker pull "$ROLLBACK_TARGET" >/dev/null 2>&1 || true\n'
         '  docker rm -f "$APP" >/dev/null 2>&1 || true\n'
         f"  {run_prev}\n"
-        '  echo "Rolled back to $PREV."\n'
+        '  echo "Rolled back to $ROLLBACK_TARGET."\n'
         "else\n"
-        '  echo "No previous image to roll back to (first deploy?)."\n'
+        '  echo "No image to roll back to (first deploy?)."\n'
         "fi\n"
         "exit 1\n"
     )

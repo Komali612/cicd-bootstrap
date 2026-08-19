@@ -40,12 +40,17 @@ from .github import (
 )
 from .ingest import IngestError, ingest
 
-def _env_file_yaml(app: str, owner: str, env: str, tag: str, port: int, registry: str) -> str:
+def _env_file_yaml(app: str, owner: str, env: str, tag: str, port: int, registry: str,
+                   approvers: list[str]) -> str:
     """The per-app/per-env values file the agent writes into environments/<env>.yaml.
 
-    This is the FR-N.6 values file: the deploy pipeline reads the image ref, tag and
-    host port from here, so nothing app-, registry- or env-specific is baked into the
-    pipeline template. Registry and the per-env port come from CDConfig (both overridable)."""
+    This is both the FR-N.6 values file (the pipeline reads image/tag/port/rollback_image
+    from here, so nothing app-, registry- or env-specific is baked into the template) and
+    the FR-N.2 config source of truth. Fields marked ``*`` below are captured here per
+    FR-N.2 but their enforcement (notify / change-request / cluster) is not wired yet —
+    config placeholders you fill in, kept out of code (same pattern as the deferred DAST
+    gate). ``approvers`` and ``rollback_image`` are wired."""
+    approver_list = ", ".join(approvers) if approvers else ""
     return (
         f"# Desired deploy state for {app} in {env}. The CD agent bumps `tag`; merging\n"
         f"# this file triggers Harness to deploy the image via the delegate.\n"
@@ -54,6 +59,14 @@ def _env_file_yaml(app: str, owner: str, env: str, tag: str, port: int, registry
         f"image: {registry}/{owner.lower()}/{app.lower()}\n"
         f"tag: {tag}\n"
         f"port: {port}\n"
+        f"\n"
+        f"# --- deployment config (FR-N.2), read from this file ---\n"
+        f"approvers: [{approver_list}]   # approver group(s) required for staging/prod\n"
+        f'rollback_image: ""            # explicit rollback target; empty = last running image\n'
+        f"notify: []                     # * notification team for failure/rollback\n"
+        f'change_request: ""            # * change-management request id (required for prod)\n'
+        f'cluster: ""                   # * target cluster (AKS)\n'
+        f'namespace: ""                 # * target namespace (AKS)\n'
     )
 
 
@@ -160,7 +173,8 @@ def add_cd_deploy_repo(
                 snapshot, auto_deploy=auto_deploy, recipe=recipe, env=env, deploy_repo=deploy_repo,
                 delegate_selector=cfg.delegate_selector, approver_user_groups=list(cfg.approver_user_groups),
             )
-            values_content = _env_file_yaml(app, owner, env, tag, cfg.env_host_port(recipe.port, env), cfg.registry)
+            values_content = _env_file_yaml(app, owner, env, tag, cfg.env_host_port(recipe.port, env),
+                                            cfg.registry, list(cfg.approver_user_groups))
             problems = validate_deploy_artifacts(pipeline_yaml, values_content, expect_approval=not auto_deploy)
             if not problems:
                 break
