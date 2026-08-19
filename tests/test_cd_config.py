@@ -5,9 +5,14 @@ via env, and that the GitOps deploy template is registry-agnostic (image comes f
 per-env values file, per FR-N.6) with the delegate and approvers parameterised (FR-N.2).
 """
 
-from cicd_bootstrap import cd_cookbooks
+from cicd_bootstrap import cd_cookbooks, cd_deploy_repo, core
 from cicd_bootstrap.cd_config import load_cd_config
+from cicd_bootstrap.contracts import BootstrapResult
 from cicd_bootstrap.harness import build_pipeline
+
+
+def _stub_cd():
+    return BootstrapResult(repo_url="x", status="opened", kind="cd")
 
 _KNOBS = (
     "CD_REGISTRY", "CD_DELEGATE_SELECTOR", "CD_ENVIRONMENTS", "CD_APPROVER_USER_GROUPS",
@@ -77,3 +82,32 @@ def test_delegate_and_approvers_are_parameterised():
     assert approval["spec"]["execution"]["steps"][0]["step"]["spec"]["approvers"]["userGroups"] == ["release_team"]
     deploy = p["pipeline"]["stages"][1]["stage"]
     assert deploy["spec"]["execution"]["steps"][0]["step"]["spec"]["delegateSelectors"] == ["aks-runner"]
+
+
+# --- Phase 4 cut-over: the default CD model is a reversible config switch ------
+
+def test_cutover_default_is_in_repo(monkeypatch):
+    """Unset CD_DEPLOY_MODEL -> the shipped default routes to the in-repo model, NOT
+    the deploy-repo one (nothing cut over until the flip)."""
+    monkeypatch.delenv("CD_DEPLOY_MODEL", raising=False)
+    routed = {"deploy_repo": False}
+    monkeypatch.setattr(cd_deploy_repo, "add_cd_deploy_repo",
+                        lambda *a, **k: routed.__setitem__("deploy_repo", True) or _stub_cd())
+    # keep the in-repo body off the network: make ingest fail fast
+    from cicd_bootstrap import ingest as ingest_mod
+    monkeypatch.setattr("cicd_bootstrap.core.ingest",
+                        lambda *a, **k: (_ for _ in ()).throw(ingest_mod.IngestError("stub")))
+    res = core.add_cd_harness("https://github.com/o/r", token="tok")
+    assert routed["deploy_repo"] is False        # did not route to deploy-repo
+    assert res.status == "error"                 # took the in-repo body (ingest stubbed)
+
+
+def test_cutover_flip_routes_to_deploy_repo(monkeypatch):
+    """CD_DEPLOY_MODEL=deploy-repo -> the same call now routes to the deploy-repo model,
+    with per-run inputs (env) passed through. Reversible: unset it to roll back."""
+    monkeypatch.setenv("CD_DEPLOY_MODEL", "deploy-repo")
+    seen = {}
+    monkeypatch.setattr(cd_deploy_repo, "add_cd_deploy_repo",
+                        lambda url, **k: seen.update(k) or _stub_cd())
+    core.add_cd_harness("https://github.com/o/r", token="tok", env="prod")
+    assert seen and seen.get("env") == "prod"    # routed to deploy-repo, inputs threaded

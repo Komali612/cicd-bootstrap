@@ -29,8 +29,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="alias for --agent cd (generate a CD/deploy workflow)")
     parser.add_argument("--auto-deploy", action="store_true",
                         help="(CD) deploy automatically to production instead of pausing for approval")
-    parser.add_argument("--deploy-model", choices=["in-repo", "deploy-repo"], default="in-repo",
-                        help="(CD) 'in-repo' stores the pipeline in the app repo (default); "
+    parser.add_argument("--deploy-model", choices=["in-repo", "deploy-repo"], default=None,
+                        help="(CD) CD model; defaults to CD_DEPLOY_MODEL (shipped 'in-repo'). "
                              "'deploy-repo' uses a separate {app}-deploy repo (GitOps)")
     parser.add_argument("--env", default="dev", help="(CD, deploy-repo) target environment (dev/staging/prod)")
     parser.add_argument("--create-deploy-repo", action="store_true",

@@ -43,3 +43,15 @@ Nothing is hard-coded; each has a sensible default. Set in `.env` to swap a serv
 | `CD_DEPLOY_REPO_SUFFIX` | `-deploy` | naming of the per-app deploy repo |
 | `CD_DEPLOY_BRANCH` | `main` | default branch of the deploy repos |
 | `CD_GATE_DAST` / `CD_GATE_PLAYWRIGHT` | `off` | optional gates (Fortify/Playwright — not implemented yet) |
+
+## 5. Phase 4 cut-over (flip the default — reversible)
+The default CD model is `in-repo` until the deploy-repo model is proven on a live run.
+To cut the whole fleet over:
+
+1. Finish the live run once (steps 1–3 above are in place: `_deploy-template` repo, token
+   scope, a sample repo with a CI image) and confirm merge → Harness deploy works.
+2. Set `CD_DEPLOY_MODEL=deploy-repo` in `.env`. That flips the CD agent UI default, the
+   CLI default, and `add_cd_harness(deploy_model=None)`. **Roll back** by unsetting it.
+3. Only *after* a release of confidence, remove the in-repo-only bits (the
+   `notify-harness` workflow, the per-pipeline webhook trigger, and the
+   `HARNESS_WEBHOOK_URL` secret write). They are kept until then.

@@ -388,7 +388,7 @@ def add_cd_harness(
     auto_deploy: bool = True,
     open_pr_flag: bool = True,
     allow_llm_fallback: bool = False,
-    deploy_model: str = "in-repo",
+    deploy_model: str | None = None,
     env: str = "dev",
     create_missing_repo: bool = False,
 ) -> BootstrapResult:
@@ -397,10 +397,18 @@ def add_cd_harness(
     ``allow_llm_fallback`` lets the LLM work out the deploy port when the repo's
     Dockerfile has no ``EXPOSE`` (for unusual apps); otherwise it defaults to 8080.
 
-    ``deploy_model="deploy-repo"`` routes to the per-app deploy-repo (GitOps) model
-    (:func:`cd_deploy_repo.add_cd_deploy_repo`); the default ``in-repo`` stores the
-    pipeline in the app repo (the body below, unchanged).
+    ``deploy_model`` selects the CD model; when ``None`` it takes the configured default
+    (``CD_DEPLOY_MODEL``, shipped as ``in-repo``). Phase 4 cut-over = set
+    ``CD_DEPLOY_MODEL=deploy-repo`` once the deploy-repo model is live-proven (reversible).
+
+    * ``deploy-repo`` routes to the per-app deploy-repo (GitOps) model
+      (:func:`cd_deploy_repo.add_cd_deploy_repo`).
+    * ``in-repo`` stores the pipeline in the app repo (the body below, unchanged).
     """
+    if deploy_model is None:
+        from .cd_config import load_cd_config
+
+        deploy_model = load_cd_config().deploy_model
     if deploy_model == "deploy-repo":
         from .cd_deploy_repo import add_cd_deploy_repo
 

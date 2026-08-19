@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from ..cd_config import load_cd_config
 from ..contracts import BootstrapResult
 from ..core import add_cd_harness
 from .common import CI_AGENT_PORT, RENDER_JS, STYLE, add_shared_routes
@@ -23,13 +24,17 @@ from .common import CI_AGENT_PORT, RENDER_JS, STYLE, add_shared_routes
 app = FastAPI(title="cicd-bootstrap · CD agent", version="0.1.0")
 add_shared_routes(app)
 
+# The configured default CD model (Phase 4 cut-over flips this via CD_DEPLOY_MODEL);
+# the UI pre-selects it, but the user can still switch per run.
+_DEFAULT_MODEL = load_cd_config().deploy_model
+
 
 class CDRequest(BaseModel):
     repo_url: str
     open_pr: bool = True
     auto_deploy: bool = False
     allow_llm_fallback: bool = False
-    deploy_model: str = "in-repo"      # "in-repo" (default) | "deploy-repo"
+    deploy_model: str | None = None    # None -> configured default (CD_DEPLOY_MODEL); else in-repo|deploy-repo
     env: str = "dev"                   # deploy-repo model: which environment
     create_deploy_repo: bool = False   # deploy-repo model: allow creating {app}-deploy
 
@@ -65,12 +70,12 @@ _BODY = f'''<span class="step">Agent 2 of 2 · CD</span>
   <button id="go" type="submit">Run CD agent</button>
 </form>
 <div class="opts">
-  <label class="chk" title="in-repo: the Harness pipeline is stored in the app repo (current behaviour)."><input type="radio" name="model" value="in-repo" checked/> in-repo <span class="sub">(pipeline in the app repo)</span></label>
-  <label class="chk" title="deploy-repo: a separate {app}-deploy repo holds the pipeline and per-env desired state; the agent opens a tag-bump PR there and Harness watches that repo (GitOps)."><input type="radio" name="model" value="deploy-repo"/> deploy-repo <span class="sub">(separate {app}-deploy repo · GitOps)</span></label>
+  <label class="chk" title="in-repo: the Harness pipeline is stored in the app repo (current behaviour)."><input type="radio" name="model" value="in-repo" {"checked" if _DEFAULT_MODEL != "deploy-repo" else ""}/> in-repo <span class="sub">(pipeline in the app repo)</span></label>
+  <label class="chk" title="deploy-repo: a separate app-deploy repo holds the pipeline and per-env desired state; the agent opens a tag-bump PR there and Harness watches that repo (GitOps)."><input type="radio" name="model" value="deploy-repo" {"checked" if _DEFAULT_MODEL == "deploy-repo" else ""}/> deploy-repo <span class="sub">(separate app-deploy repo · GitOps)</span></label>
 </div>
 <div class="opts deploy-repo-only" style="display:none">
   <label class="chk">environment&nbsp;<select id="env"><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
-  <label class="chk" title="The deploy-repo model needs a per-app {app}-deploy repo. Tick to let the agent CREATE it from the _deploy-template template repo if it does not exist (this creates a GitHub repository)."><input id="createrepo" type="checkbox"/> create the deploy repo if missing</label>
+  <label class="chk" title="The deploy-repo model needs a per-app app-deploy repo. Tick to let the agent CREATE it from the _deploy-template template repo if it does not exist (this creates a GitHub repository)."><input id="createrepo" type="checkbox"/> create the deploy repo if missing</label>
 </div>
 <div class="opts">
   <label class="chk" title="Adds a small notify-harness.yml workflow so FUTURE CI builds auto-deploy. The image already in GHCR deploys now either way. (in-repo model only)"><input id="pr" type="checkbox" checked/> open the notify-harness pull request (for future auto-deploys)</label>

@@ -40,6 +40,11 @@ def _env_flag(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class CDConfig:
+    # --- cut-over: which CD model is the default (Phase 4) -----------------------
+    # Stays "in-repo" until the deploy-repo model is proven on a live run; flip the whole
+    # fleet to the deploy-repo model by setting CD_DEPLOY_MODEL=deploy-repo (reversible).
+    deploy_model: str = field(default_factory=lambda: _env("CD_DEPLOY_MODEL", "in-repo"))
+
     # --- deploy-repo conventions -------------------------------------------------
     template_repo: str = field(default_factory=lambda: _env("CD_TEMPLATE_REPO", "_deploy-template"))
     deploy_repo_suffix: str = field(default_factory=lambda: _env("CD_DEPLOY_REPO_SUFFIX", "-deploy"))
