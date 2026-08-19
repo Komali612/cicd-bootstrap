@@ -25,7 +25,6 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import time
 
 import httpx
 import yaml
@@ -400,84 +399,6 @@ def _raise_for(resp: httpx.Response, what: str) -> dict:
         msgs = body.get("responseMessages") or body.get("message") or body.get("raw")
         raise HarnessError(f"{what} failed ({resp.status_code}): {msgs}")
     return body
-
-
-def create_pipeline(pipeline_yaml: str, cfg: HarnessConfig | None = None) -> str:
-    """Create (or fail if exists) a pipeline from YAML. Returns its identifier."""
-    cfg = (cfg or HarnessConfig()).require()
-    resp = httpx.post(
-        f"{cfg.pipeline_base}/pipelines/v2",
-        params=cfg.scope, headers=cfg.headers(yaml_body=True),
-        content=pipeline_yaml, timeout=60,
-    )
-    body = _raise_for(resp, "create pipeline")
-    return (body.get("data") or {}).get("identifier", "")
-
-
-def update_pipeline(pipeline_id: str, pipeline_yaml: str, cfg: HarnessConfig | None = None) -> None:
-    """Update an existing pipeline's YAML (idempotent re-provisioning)."""
-    cfg = (cfg or HarnessConfig()).require()
-    resp = httpx.put(
-        f"{cfg.pipeline_base}/pipelines/v2/{pipeline_id}",
-        params=cfg.scope, headers=cfg.headers(yaml_body=True),
-        content=pipeline_yaml, timeout=60,
-    )
-    _raise_for(resp, "update pipeline")
-
-
-def upsert_pipeline(pipeline_yaml: str, pipeline_id: str, cfg: HarnessConfig | None = None) -> str:
-    """Create the pipeline, or update it if it already exists."""
-    cfg = (cfg or HarnessConfig()).require()
-    try:
-        return create_pipeline(pipeline_yaml, cfg)
-    except HarnessError:
-        update_pipeline(pipeline_id, pipeline_yaml, cfg)
-        return pipeline_id
-
-
-def execute_pipeline(pipeline_id: str, image_tag: str, cfg: HarnessConfig | None = None) -> str:
-    """Trigger a run, passing the image tag as the runtime input. Returns planExecutionId."""
-    cfg = (cfg or HarnessConfig()).require()
-    inputs = yaml.dump(
-        {"pipeline": {"identifier": pipeline_id,
-                      "variables": [{"name": "imageTag", "type": "String", "value": image_tag}]}},
-        sort_keys=False,
-    )
-    resp = httpx.post(
-        f"{cfg.pipeline_base}/pipeline/execute/{pipeline_id}",
-        params={**cfg.scope, "moduleType": "cd"},
-        headers=cfg.headers(yaml_body=True), content=inputs, timeout=60,
-    )
-    body = _raise_for(resp, "execute pipeline")
-    data = body.get("data") or {}
-    return data.get("planExecutionId") or (data.get("planExecution") or {}).get("uuid", "")
-
-
-def execution_status(plan_execution_id: str, cfg: HarnessConfig | None = None) -> str:
-    """Current status of a run: Running/Success/Failed/Aborted/etc."""
-    cfg = (cfg or HarnessConfig()).require()
-    resp = httpx.get(
-        f"{cfg.pipeline_base}/pipelines/execution/v2/{plan_execution_id}",
-        params=cfg.scope, headers=cfg.headers(), timeout=30,
-    )
-    body = _raise_for(resp, "execution status")
-    return ((body.get("data") or {}).get("pipelineExecutionSummary") or {}).get("status", "Unknown")
-
-
-def wait_for_execution(
-    plan_execution_id: str, cfg: HarnessConfig | None = None, *, timeout_s: int = 600, interval_s: int = 10
-) -> str:
-    """Poll until the run reaches a terminal status; return it."""
-    cfg = cfg or HarnessConfig()
-    terminal = {"Success", "Failed", "Aborted", "Errored", "Expired", "ApprovalRejected", "IgnoreFailed"}
-    deadline = time.monotonic() + timeout_s
-    status = "Unknown"
-    while time.monotonic() < deadline:
-        status = execution_status(plan_execution_id, cfg)
-        if status in terminal:
-            return status
-        time.sleep(interval_s)
-    return status
 
 
 # --- Git storage: secret + GitHub connector + remote (Git-stored) pipeline ----

@@ -29,7 +29,7 @@ from .github import (
     open_pr_files,
     resolve_token,
     set_repo_secret,
-    wait_for_ci_success,
+    wait_for_ci_success,  # re-exported: graph.py calls core.wait_for_ci_success (patched in tests)
 )
 from .ingest import IngestError, ingest, parse_repo_url
 from .sonar import provision_project
