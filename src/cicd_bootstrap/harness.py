@@ -129,17 +129,21 @@ def _health_block(recipe: DeployRecipe) -> str:
     )
 
 
-def _gitops_tag_line(owner: str, deploy_repo: str) -> str:
-    """Shell that resolves TAG from the deploy repo's environments/<env>.yaml (the
-    source of truth) instead of taking it as a pipeline input. GH_TOKEN is injected as
+def _gitops_desired_state(owner: str, deploy_repo: str, *, read_port: bool) -> str:
+    """Shell that reads the desired state -- the image TAG, and (for a web service) the
+    host PORT -- from the deploy repo's environments/<env>.yaml, the source of truth,
+    instead of taking them as pipeline inputs. Reading the host port per env lets
+    dev/staging/prod publish distinct ports on the one delegate. GH_TOKEN is injected as
     a masked secret env var by the deploy stage; the delegate needs curl + network
     egress to api.github.com."""
+    port_read = ("""PORT="$(printf '%s\\n' "$DESIRED" | sed -n 's/^port:[[:space:]]*//p' | tr -d '"' | head -n1)"
+""" if read_port else "")
     return f'''ENV="<+pipeline.variables.env>"
 DEPLOY_REPO="{owner}/{deploy_repo}"
-echo "Resolving image tag from $DEPLOY_REPO (environments/$ENV.yaml)"
+echo "Resolving desired state from $DEPLOY_REPO (environments/$ENV.yaml)"
 DESIRED="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$DEPLOY_REPO/contents/environments/$ENV.yaml")"
 TAG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^tag:[[:space:]]*//p' | tr -d '"' | head -n1)"
-if [ -z "$TAG" ]; then echo "No tag found in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
+{port_read}if [ -z "$TAG" ]; then echo "No tag found in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
 echo "Desired tag: $TAG"
 '''
 
@@ -157,25 +161,32 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
     # dev/staging/prod can run side by side on one delegate; env is a pipeline variable
     # Harness resolves before the script runs. env_scoped=False keeps the original name.
     app = f"{name.lower()}-<+pipeline.variables.env>" if env_scoped else name.lower()
-    port = recipe.port
-
-    publish = f"-p {port}:{port} " if recipe.publish_port else ""
+    container_port = recipe.port
     env_flags = "".join(f"-e {shlex.quote(f'{n}={v}')} " for n, v in recipe.env)
     cmd_suffix = "".join(f" {shlex.quote(c)}" for c in recipe.run_command)
+
+    if deploy_repo:
+        # GitOps: the tag AND the host port come from environments/<env>.yaml, so each env
+        # can publish its own host port on the one delegate. The container port stays the
+        # app's own port; only the host port ($PORT) varies per env.
+        tag_line = _gitops_desired_state(owner, deploy_repo, read_port=recipe.publish_port)
+        publish = f"-p $PORT:{container_port} " if recipe.publish_port else ""
+        port_line = ""  # PORT is set by the desired-state read above
+        where = " on host port $PORT" if recipe.publish_port else " (no published port)"
+    else:
+        # In-repo: tag is the pipeline's imageTag input; host == container port.
+        tag_line = 'TAG="<+pipeline.variables.imageTag>"\n'
+        publish = f"-p {container_port}:{container_port} " if recipe.publish_port else ""
+        port_line = f'PORT="{container_port}"\n' if recipe.publish_port else ""
+        where = " on port $PORT" if recipe.publish_port else " (no published port)"
+
     run_new = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$IMAGE"{cmd_suffix}'
     run_prev = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$PREV"{cmd_suffix}'
-
-    port_line = f'PORT="{port}"\n' if recipe.publish_port else ""
-    where = " on port $PORT" if recipe.publish_port else " (no published port)"
     success = (
         "Deploy successful -- '$APP' is up and answering (HTTP $code)."
         if recipe.health_type == HEALTH_HTTP
         else "Deploy successful -- '$APP' is up and staying running."
     )
-
-    # GitOps (deploy_repo): read the tag from environments/<env>.yaml. Otherwise the
-    # tag is the pipeline's imageTag input (the in-repo model, unchanged).
-    tag_line = _gitops_tag_line(owner, deploy_repo) if deploy_repo else 'TAG="<+pipeline.variables.imageTag>"\n'
     return (
         "set +e\n"
         f"{tag_line}"
@@ -258,8 +269,8 @@ def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bo
     }
 
 
-def _approval_stage() -> dict:
-    return {
+def _approval_stage(*, env_conditional: bool = False) -> dict:
+    stage = {
         "stage": {
             "name": "Approval",
             "identifier": "Approval",
@@ -292,6 +303,13 @@ def _approval_stage() -> dict:
             "tags": {},
         }
     }
+    if env_conditional:
+        # dev auto-deploys on merge; staging/prod pause for a Harness approval.
+        stage["stage"]["when"] = {
+            "pipelineStatus": "Success",
+            "condition": '<+pipeline.variables.env> != "dev"',
+        }
+    return stage
 
 
 def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: bool, org: str, project: str,
@@ -311,7 +329,9 @@ def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: 
     gitops = deploy_repo is not None
     stages: list[dict] = []
     if not auto_deploy:
-        stages.append(_approval_stage())
+        # GitOps gates only non-dev environments (dev auto-deploys on merge); the in-repo
+        # model keeps its single unconditional approval.
+        stages.append(_approval_stage(env_conditional=gitops))
     stages.append(_deploy_stage(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo))
     if gitops:
         # GitOps: the tag is read from environments/<env>.yaml at run time, so the only
@@ -691,16 +711,18 @@ GITOPS_TRIGGER_PREFIX = "gitops"
 
 def ensure_git_trigger(
     pipeline_id: str, connector_ref: str, repo: str, cfg: HarnessConfig | None = None, *,
-    branch: str = "main", path_glob: str = "environments/**", env: str = "dev",
+    branch: str = "main", path_glob: str | None = None, env: str = "dev",
 ) -> str:
     """Create (or update) a GitHub *push* trigger on ``repo`` that runs ``pipeline_id``
-    when files under ``environments/**`` change. Idempotent; returns the trigger id.
+    when ``environments/<env>.yaml`` changes. One trigger per env (so a change to a given
+    env's file deploys that env). Idempotent; returns the trigger id.
 
     The pipeline reads the image tag from ``environments/<env>.yaml`` itself (the deploy
     repo is the source of truth), so the trigger only needs to supply which ``env`` to
     deploy."""
     cfg = (cfg or HarnessConfig()).require()
-    trigger_id = f"{GITOPS_TRIGGER_PREFIX}_{identifier(pipeline_id)}"
+    path = path_glob or f"environments/{env}.yaml"
+    trigger_id = f"{GITOPS_TRIGGER_PREFIX}_{identifier(pipeline_id)}_{identifier(env)}"
     input_yaml = yaml.dump(
         {"pipeline": {"identifier": pipeline_id, "variables": [
             {"name": "env", "type": "String", "value": env},
@@ -719,7 +741,7 @@ def ensure_git_trigger(
                 "autoAbortPreviousExecutions": False,
                 "payloadConditions": [
                     {"key": "targetBranch", "operator": "Equals", "value": branch},
-                    {"key": "changedFiles", "operator": "Contains", "value": path_glob},
+                    {"key": "changedFiles", "operator": "Contains", "value": path},
                 ],
                 "headerConditions": [],
                 "actions": [],

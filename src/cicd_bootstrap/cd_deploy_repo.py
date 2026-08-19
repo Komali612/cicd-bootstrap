@@ -44,9 +44,21 @@ DEPLOY_REPO_SUFFIX = "-deploy"
 # newly generated repos); Phase 2 confirms this against a real template.
 DEPLOY_BRANCH = "main"
 
+# Environments the deploy repo supports. A Harness trigger is created per env so a change
+# to environments/<env>.yaml deploys that env. Distinct host-port offsets let dev/staging/
+# prod run side by side on the one delegate.
+ENVIRONMENTS = ("dev", "staging", "prod")
+_PORT_OFFSET = {"dev": 0, "staging": 1, "prod": 2}
+
 
 def deploy_repo_name(app: str) -> str:
     return f"{app}{DEPLOY_REPO_SUFFIX}"
+
+
+def _env_host_port(recipe, env: str) -> int:
+    """Host port for this env: the app's container port plus a per-env offset, so
+    dev/staging/prod don't collide on the one delegate. Harmless for a portless worker."""
+    return recipe.port + _PORT_OFFSET.get(env, 0)
 
 
 def _env_file_yaml(app: str, owner: str, env: str, tag: str, port: int) -> str:
@@ -165,15 +177,22 @@ def add_cd_deploy_repo(
                 message=f"Harness provisioning failed: {exc}",
             )
 
+        # One Harness trigger per environment, so a change to environments/<env>.yaml
+        # deploys that env. Non-fatal: the PR still opens if a trigger can't be set up.
         trigger_note = ""
-        try:
-            harness.ensure_git_trigger(
-                pid, harness.GITHUB_CONNECTOR_ID, deploy_repo, branch=DEPLOY_BRANCH, env=env,
-            )
-        except harness.HarnessError as exc:  # non-fatal: the PR still opens
-            trigger_note = f" (couldn't set up the Harness git trigger yet: {exc})"
+        failed = []
+        for e in ENVIRONMENTS:
+            try:
+                harness.ensure_git_trigger(
+                    pid, harness.GITHUB_CONNECTOR_ID, deploy_repo, branch=DEPLOY_BRANCH, env=e,
+                )
+            except harness.HarnessError as exc:
+                failed.append(f"{e}: {exc}")
+        if failed:
+            trigger_note = f" (couldn't set up some Harness triggers yet: {'; '.join(failed)})"
 
-        gate = "automatic (no gate)" if auto_deploy else "manual approval (Harness approval stage)"
+        gate = ("automatic (no gate)" if auto_deploy
+                else "dev auto-deploys on merge; staging/prod pause for approval")
         workflow = GeneratedWorkflow(
             path=f"{deploy_repo}/{harness.HARNESS_PIPELINE_PATH}",
             content=pipeline_yaml,
@@ -187,7 +206,7 @@ def add_cd_deploy_repo(
         # Open the tag-bump PR into the deploy repo (never merged -- merging deploys).
         tag = latest_successful_ci_sha(owner, app, snapshot.default_branch, token) or ""
         env_path = f"environments/{env}.yaml"
-        content = _env_file_yaml(app, owner, env, tag, recipe.port)
+        content = _env_file_yaml(app, owner, env, tag, _env_host_port(recipe, env))
         try:
             pr_number, pr_url, branch = open_pr_in_repo(
                 owner, deploy_repo, [(env_path, content)], token,

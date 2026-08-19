@@ -50,7 +50,8 @@ def _patch(monkeypatch, *, exists: bool, image: bool = True) -> _Calls:
 
     def fake_trigger(pid, connector, repo, *, branch="main", env="dev", **kw):
         calls["trigger"] = {"pid": pid, "repo": repo, "env": env}
-        return "gitops_deploy_researcher"
+        calls.setdefault("trigger_envs", []).append(env)
+        return f"gitops_deploy_researcher_{env}"
 
     def fake_open_pr(owner, name, files, token, *, base, branch_prefix, title, body, commit_message):
         calls["pr"] = {"repo": f"{owner}/{name}", "files": files, "title": title}
@@ -166,6 +167,38 @@ def test_add_cd_harness_dispatch_routes_to_deploy_repo(monkeypatch):
     )
     core.add_cd_harness("https://github.com/Owner/researcher", deploy_model="deploy-repo", env="dev")
     assert seen["env"] == "dev"
+
+
+# --- Phase 3: multi-environment (approval, per-env host port, per-env triggers) ----
+
+def test_gitops_approval_gates_only_non_dev():
+    # dev auto-deploys on merge; staging/prod pause for a Harness approval.
+    p = build_pipeline("Owner", "app", _recipe(), auto_deploy=False, org="default", project="p",
+                       env="dev", deploy_repo="app-deploy")
+    stages = [s["stage"] for s in p["pipeline"]["stages"]]
+    assert [s["type"] for s in stages] == ["Approval", "Custom"]
+    assert stages[0]["when"]["condition"] == '<+pipeline.variables.env> != "dev"'
+
+
+def test_gitops_deploy_script_reads_host_port_from_env_file():
+    p = build_pipeline("Owner", "app", _recipe(), auto_deploy=True, org="default", project="p",
+                       env="dev", deploy_repo="app-deploy")
+    script = _deploy_script(p)
+    assert "s/^port:" in script          # reads the host port from environments/<env>.yaml
+    assert "-p $PORT:8080" in script      # host $PORT -> container's own port (8080)
+
+
+def test_creates_a_trigger_per_environment(monkeypatch):
+    calls = _patch(monkeypatch, exists=True)
+    cd_deploy_repo.add_cd_deploy_repo("https://github.com/Owner/researcher", env="dev", token="tok")
+    assert calls["trigger_envs"] == ["dev", "staging", "prod"]   # one trigger per env
+
+
+def test_env_file_uses_per_env_host_port(monkeypatch):
+    calls = _patch(monkeypatch, exists=True)
+    cd_deploy_repo.add_cd_deploy_repo("https://github.com/Owner/researcher", env="staging", token="tok")
+    _, content = calls["pr"]["files"][0]
+    assert "port: 8081" in content        # staging = container port (8080) + 1
 
 
 def _stub_result():

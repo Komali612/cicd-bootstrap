@@ -21,3 +21,10 @@ from a shared GitHub **template repository**. Two one-time prerequisites:
   new deploy repos so Harness can watch `environments/**`.
 
 Until these are in place, keep the CD agent on its default **in-repo** model.
+
+## 4. Approvers for staging/prod
+- `templates/deploy/.github/CODEOWNERS` gates `environments/staging.yaml` and
+  `environments/prod.yaml` on a release approver. Replace `@RELEASE-APPROVER` with your
+  GitHub user or team before using the template.
+- The Harness pipeline also pauses staging/prod for a manual approval (dev deploys on
+  merge with no gate). Both gates are independent — the PR review and the Harness approval.
