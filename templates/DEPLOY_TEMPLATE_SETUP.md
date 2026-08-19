@@ -28,3 +28,18 @@ Until these are in place, keep the CD agent on its default **in-repo** model.
   GitHub user or team before using the template.
 - The Harness pipeline also pauses staging/prod for a manual approval (dev deploys on
   merge with no gate). Both gates are independent — the PR review and the Harness approval.
+
+## 4. Configuration knobs (loosely coupled — override any of these via env)
+Nothing is hard-coded; each has a sensible default. Set in `.env` to swap a service:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `CD_REGISTRY` | `ghcr.io` | image registry written into the values file (swap for Nexus, etc.) |
+| `CD_DELEGATE_SELECTOR` | `laptop` | Harness delegate/target selector |
+| `CD_DEPLOY_STRATEGY` | `recreate` | deploy strategy (blue/green reserved) |
+| `CD_ENVIRONMENTS` | `dev,staging,prod` | environments (order sets per-env host-port offset) |
+| `CD_APPROVER_USER_GROUPS` | `_project_all_users` | Harness approver group(s) for staging/prod |
+| `CD_TEMPLATE_REPO` | `_deploy-template` | template repo the `{app}-deploy` repos are stamped from |
+| `CD_DEPLOY_REPO_SUFFIX` | `-deploy` | naming of the per-app deploy repo |
+| `CD_DEPLOY_BRANCH` | `main` | default branch of the deploy repos |
+| `CD_GATE_DAST` / `CD_GATE_PLAYWRIGHT` | `off` | optional gates (Fortify/Playwright — not implemented yet) |

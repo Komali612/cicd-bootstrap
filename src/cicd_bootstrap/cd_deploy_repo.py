@@ -25,6 +25,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from .cd_config import load_cd_config
 from .config import load_dotenv
 from .contracts import BootstrapResult, GeneratedWorkflow
 from .github import (
@@ -38,37 +39,18 @@ from .github import (
 )
 from .ingest import IngestError, ingest
 
-TEMPLATE_REPO = "_deploy-template"
-DEPLOY_REPO_SUFFIX = "-deploy"
-# Deploy repos are created with "main" as the default branch (GitHub's default for
-# newly generated repos); Phase 2 confirms this against a real template.
-DEPLOY_BRANCH = "main"
+def _env_file_yaml(app: str, owner: str, env: str, tag: str, port: int, registry: str) -> str:
+    """The per-app/per-env values file the agent writes into environments/<env>.yaml.
 
-# Environments the deploy repo supports. A Harness trigger is created per env so a change
-# to environments/<env>.yaml deploys that env. Distinct host-port offsets let dev/staging/
-# prod run side by side on the one delegate.
-ENVIRONMENTS = ("dev", "staging", "prod")
-_PORT_OFFSET = {"dev": 0, "staging": 1, "prod": 2}
-
-
-def deploy_repo_name(app: str) -> str:
-    return f"{app}{DEPLOY_REPO_SUFFIX}"
-
-
-def _env_host_port(recipe, env: str) -> int:
-    """Host port for this env: the app's container port plus a per-env offset, so
-    dev/staging/prod don't collide on the one delegate. Harmless for a portless worker."""
-    return recipe.port + _PORT_OFFSET.get(env, 0)
-
-
-def _env_file_yaml(app: str, owner: str, env: str, tag: str, port: int) -> str:
-    """The desired-state file the agent writes into environments/<env>.yaml."""
+    This is the FR-N.6 values file: the deploy pipeline reads the image ref, tag and
+    host port from here, so nothing app-, registry- or env-specific is baked into the
+    pipeline template. Registry and the per-env port come from CDConfig (both overridable)."""
     return (
         f"# Desired deploy state for {app} in {env}. The CD agent bumps `tag`; merging\n"
-        f"# this file triggers Harness to deploy the image on the laptop delegate.\n"
+        f"# this file triggers Harness to deploy the image via the delegate.\n"
         f"app: {app}\n"
         f"env: {env}\n"
-        f"image: ghcr.io/{owner.lower()}/{app.lower()}\n"
+        f"image: {registry}/{owner.lower()}/{app.lower()}\n"
         f"tag: {tag}\n"
         f"port: {port}\n"
     )
@@ -82,7 +64,7 @@ def add_cd_deploy_repo(
     auto_deploy: bool = True,
     allow_llm_fallback: bool = False,
     create_missing_repo: bool = False,
-    template_repo: str = TEMPLATE_REPO,
+    template_repo: str | None = None,
 ) -> BootstrapResult:
     """Set up CD for a repo using the per-app deploy-repo model. Requires HARNESS_*
     in .env and a GitHub token that can create repositories (see
@@ -90,6 +72,8 @@ def add_cd_deploy_repo(
     from . import harness  # local import: Harness is optional; only needed on this path
 
     load_dotenv()
+    cfg = load_cd_config()
+    template_repo = template_repo or cfg.template_repo
     token = token or resolve_token()
     if not token:
         return BootstrapResult(
@@ -104,7 +88,7 @@ def add_cd_deploy_repo(
             return BootstrapResult(repo_url=repo_url, status="error", kind="cd", message=str(exc))
 
         owner, app = snapshot.owner, snapshot.name
-        deploy_repo = deploy_repo_name(app)
+        deploy_repo = cfg.deploy_repo_name(app)
 
         # Same image gate as the in-repo path: deploying only makes sense once CI has
         # actually pushed an image to GHCR.
@@ -166,9 +150,10 @@ def add_cd_deploy_repo(
         try:
             pipeline_yaml = harness.build_pipeline_yaml(
                 snapshot, auto_deploy=auto_deploy, recipe=recipe, env=env, deploy_repo=deploy_repo,
+                delegate_selector=cfg.delegate_selector, approver_user_groups=list(cfg.approver_user_groups),
             )
             pid = harness.store_pipeline_in_repo(
-                snapshot, token, auto_deploy=auto_deploy, branch=DEPLOY_BRANCH,
+                snapshot, token, auto_deploy=auto_deploy, branch=cfg.deploy_branch,
                 pipeline_yaml=pipeline_yaml, repo=deploy_repo,
             )
         except harness.HarnessError as exc:
@@ -181,15 +166,21 @@ def add_cd_deploy_repo(
         # deploys that env. Non-fatal: the PR still opens if a trigger can't be set up.
         trigger_note = ""
         failed = []
-        for e in ENVIRONMENTS:
+        for e in cfg.environments:
             try:
                 harness.ensure_git_trigger(
-                    pid, harness.GITHUB_CONNECTOR_ID, deploy_repo, branch=DEPLOY_BRANCH, env=e,
+                    pid, harness.GITHUB_CONNECTOR_ID, deploy_repo, branch=cfg.deploy_branch, env=e,
                 )
             except harness.HarnessError as exc:
                 failed.append(f"{e}: {exc}")
         if failed:
             trigger_note = f" (couldn't set up some Harness triggers yet: {'; '.join(failed)})"
+
+        # Never silently no-op a requested-but-unbuilt gate (e.g. DAST/Fortify is paused).
+        gate_note = ""
+        pending_gates = cfg.deferred_gates()
+        if pending_gates:
+            gate_note = f" (requested gate(s) not yet implemented, ignored: {', '.join(pending_gates)})"
 
         gate = ("automatic (no gate)" if auto_deploy
                 else "dev auto-deploys on merge; staging/prod pause for approval")
@@ -206,16 +197,16 @@ def add_cd_deploy_repo(
         # Open the tag-bump PR into the deploy repo (never merged -- merging deploys).
         tag = latest_successful_ci_sha(owner, app, snapshot.default_branch, token) or ""
         env_path = f"environments/{env}.yaml"
-        content = _env_file_yaml(app, owner, env, tag, _env_host_port(recipe, env))
+        content = _env_file_yaml(app, owner, env, tag, cfg.env_host_port(recipe.port, env), cfg.registry)
         try:
             pr_number, pr_url, branch = open_pr_in_repo(
                 owner, deploy_repo, [(env_path, content)], token,
-                base=DEPLOY_BRANCH,
+                base=cfg.deploy_branch,
                 branch_prefix=f"cicd-bootstrap/deploy-{env}",
                 title=f"deploy({app}): {env} → {tag[:7]}",
                 body=(
                     f"Set **{app}** in **{env}** to `{tag[:12]}`.\n\n"
-                    f"Image: `ghcr.io/{owner.lower()}/{app.lower()}:{tag[:12]}`\n\n"
+                    f"Image: `{cfg.registry}/{owner.lower()}/{app.lower()}:{tag[:12]}`\n\n"
                     f"**Merging this PR deploys it** — Harness watches this repo. "
                     f"The CD agent does not merge its own PR."
                 ),
@@ -236,6 +227,6 @@ def add_cd_deploy_repo(
             pr_number=pr_number, pr_url=pr_url, branch=branch,
             message=(
                 f"Opened a deploy PR in '{owner}/{deploy_repo}' setting {env} → {tag[:7]}. "
-                f"Merge it to deploy (Harness watches the repo).{created_note}{trigger_note}"
+                f"Merge it to deploy (Harness watches the repo).{created_note}{trigger_note}{gate_note}"
             ),
         )

@@ -142,9 +142,10 @@ def _gitops_desired_state(owner: str, deploy_repo: str, *, read_port: bool) -> s
 DEPLOY_REPO="{owner}/{deploy_repo}"
 echo "Resolving desired state from $DEPLOY_REPO (environments/$ENV.yaml)"
 DESIRED="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$DEPLOY_REPO/contents/environments/$ENV.yaml")"
+IMG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^image:[[:space:]]*//p' | tr -d '"' | head -n1)"
 TAG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^tag:[[:space:]]*//p' | tr -d '"' | head -n1)"
-{port_read}if [ -z "$TAG" ]; then echo "No tag found in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
-echo "Desired tag: $TAG"
+{port_read}if [ -z "$TAG" ] || [ -z "$IMG" ]; then echo "Missing image/tag in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
+echo "Desired image: $IMG:$TAG"
 '''
 
 
@@ -166,16 +167,18 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
     cmd_suffix = "".join(f" {shlex.quote(c)}" for c in recipe.run_command)
 
     if deploy_repo:
-        # GitOps: the tag AND the host port come from environments/<env>.yaml, so each env
-        # can publish its own host port on the one delegate. The container port stays the
-        # app's own port; only the host port ($PORT) varies per env.
+        # GitOps: the image ref, tag AND host port all come from environments/<env>.yaml,
+        # so the pipeline template is registry-agnostic and each env can publish its own
+        # host port on the one delegate. Only the host port ($PORT) varies per env.
         tag_line = _gitops_desired_state(owner, deploy_repo, read_port=recipe.publish_port)
+        image_line = 'IMAGE="$IMG:$TAG"\n'  # $IMG (incl. registry) read from the values file
         publish = f"-p $PORT:{container_port} " if recipe.publish_port else ""
         port_line = ""  # PORT is set by the desired-state read above
         where = " on host port $PORT" if recipe.publish_port else " (no published port)"
     else:
         # In-repo: tag is the pipeline's imageTag input; host == container port.
         tag_line = 'TAG="<+pipeline.variables.imageTag>"\n'
+        image_line = f'IMAGE="{image}:$TAG"\n'
         publish = f"-p {container_port}:{container_port} " if recipe.publish_port else ""
         port_line = f'PORT="{container_port}"\n' if recipe.publish_port else ""
         where = " on port $PORT" if recipe.publish_port else " (no published port)"
@@ -190,7 +193,7 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
     return (
         "set +e\n"
         f"{tag_line}"
-        f'IMAGE="{image}:$TAG"\n'
+        f"{image_line}"
         f'APP="{app}"\n'
         f"{port_line}"
         f"echo \"Deploying $IMAGE  ->  container '$APP'{where}\"\n"
@@ -229,7 +232,7 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scop
 
 
 def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False,
-                  deploy_repo: str | None = None) -> dict:
+                  deploy_repo: str | None = None, delegate_selector: str = DELEGATE_SELECTOR) -> dict:
     # GitOps: inject the GitHub token as a masked secret env var so the deploy script
     # can read environments/<env>.yaml from the deploy repo.
     env_vars = ([{"name": "GH_TOKEN", "type": "Secret", "value": identifier(TOKEN_SECRET_NAME)}]
@@ -251,7 +254,7 @@ def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bo
                                 "spec": {
                                     "shell": "Bash",
                                     "onDelegate": True,
-                                    "delegateSelectors": [DELEGATE_SELECTOR],
+                                    "delegateSelectors": [delegate_selector],
                                     "source": {
                                         "type": "Inline",
                                         "spec": {"script": build_deploy_script(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo)},
@@ -269,7 +272,8 @@ def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bo
     }
 
 
-def _approval_stage(*, env_conditional: bool = False) -> dict:
+def _approval_stage(*, env_conditional: bool = False, approver_user_groups: list[str] | None = None) -> dict:
+    groups = approver_user_groups or ["_project_all_users"]
     stage = {
         "stage": {
             "name": "Approval",
@@ -289,7 +293,7 @@ def _approval_stage(*, env_conditional: bool = False) -> dict:
                                     "includePipelineExecutionHistory": True,
                                     "isAutoRejectEnabled": False,
                                     "approvers": {
-                                        "userGroups": ["_project_all_users"],
+                                        "userGroups": groups,
                                         "minimumCount": 1,
                                         "disallowPipelineExecutor": False,
                                     },
@@ -313,7 +317,8 @@ def _approval_stage(*, env_conditional: bool = False) -> dict:
 
 
 def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: bool, org: str, project: str,
-                   env: str | None = None, deploy_repo: str | None = None) -> dict:
+                   env: str | None = None, deploy_repo: str | None = None,
+                   delegate_selector: str = DELEGATE_SELECTOR, approver_user_groups: list[str] | None = None) -> dict:
     """The Harness pipeline dict: (optional approval ->) deploy on the laptop delegate.
 
     Three shapes:
@@ -331,8 +336,9 @@ def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: 
     if not auto_deploy:
         # GitOps gates only non-dev environments (dev auto-deploys on merge); the in-repo
         # model keeps its single unconditional approval.
-        stages.append(_approval_stage(env_conditional=gitops))
-    stages.append(_deploy_stage(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo))
+        stages.append(_approval_stage(env_conditional=gitops, approver_user_groups=approver_user_groups))
+    stages.append(_deploy_stage(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo,
+                                delegate_selector=delegate_selector))
     if gitops:
         # GitOps: the tag is read from environments/<env>.yaml at run time, so the only
         # pipeline input is which environment to deploy.
@@ -365,7 +371,9 @@ def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: 
 
 def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
                         recipe: DeployRecipe | None = None, allow_llm_fallback: bool = False,
-                        env: str | None = None, deploy_repo: str | None = None) -> str:
+                        env: str | None = None, deploy_repo: str | None = None,
+                        delegate_selector: str = DELEGATE_SELECTOR,
+                        approver_user_groups: list[str] | None = None) -> str:
     cfg = HarnessConfig()
     if recipe is None:
         # Resolve the deploy recipe (built-in shape, or LLM-authored when none
@@ -376,6 +384,7 @@ def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
     pipe = build_pipeline(
         snapshot.owner, snapshot.name, recipe,
         auto_deploy=auto_deploy, org=cfg.org, project=cfg.project, env=env, deploy_repo=deploy_repo,
+        delegate_selector=delegate_selector, approver_user_groups=approver_user_groups,
     )
     return yaml.dump(pipe, sort_keys=False, default_flow_style=False, width=4096)
 

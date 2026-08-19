@@ -1,9 +1,6 @@
 # Desired deploy state for this app in the `staging` environment.
-# The CD agent bumps `tag`; merging this file triggers Harness to deploy on the
-# laptop delegate. `port` is the host port for this env (kept distinct per env so
-# dev/staging/prod can run side by side on one delegate).
-#
-# Placeholders in the template; the CD agent overwrites this file on first deploy.
+# The CD agent overwrites this file (image/tag/port) on the first staging deploy; merging a
+# change here triggers Harness to deploy that env. Prod/staging need a CODEOWNERS approve.
 app: APP_NAME
 env: staging
 image: ghcr.io/OWNER/APP_NAME

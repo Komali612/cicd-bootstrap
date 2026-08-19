@@ -1,4 +1,4 @@
-# Production and staging deploys require a release approver before the PR can merge.
-# Replace @RELEASE-APPROVER with your GitHub user or team, e.g. @your-org/release.
-/environments/prod.yaml     @RELEASE-APPROVER
-/environments/staging.yaml  @RELEASE-APPROVER
+# Production and staging deploys require a release approver's review before merge.
+# Replace @RELEASE_APPROVER with your team/user (dev is intentionally not gated here).
+environments/prod.yaml     @RELEASE_APPROVER
+environments/staging.yaml  @RELEASE_APPROVER
