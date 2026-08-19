@@ -38,6 +38,14 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw in ("1", "on", "true", "yes")
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class CDConfig:
     # --- cut-over: which CD model is the default (Phase 4) -----------------------
@@ -72,6 +80,11 @@ class CDConfig:
     gate_health: bool = field(default_factory=lambda: _env_flag("CD_GATE_HEALTH", True))
     gate_dast: bool = field(default_factory=lambda: _env_flag("CD_GATE_DAST", False))       # Fortify — paused
     gate_playwright: bool = field(default_factory=lambda: _env_flag("CD_GATE_PLAYWRIGHT", False))
+
+    # --- Generate -> Validate loop (FR-N.10 / NFR-3) -----------------------------
+    max_attempts: int = field(default_factory=lambda: _env_int("CD_MAX_ATTEMPTS", 3))
+    exception_list_path: str = field(
+        default_factory=lambda: _env("CD_EXCEPTION_LIST", "open-questions/cd-exceptions.md"))
 
     def deploy_repo_name(self, app: str) -> str:
         return f"{app}{self.deploy_repo_suffix}"

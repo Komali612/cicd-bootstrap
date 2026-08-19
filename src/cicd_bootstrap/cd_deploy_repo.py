@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 
 from .cd_config import load_cd_config
+from .cd_validate import record_exception, validate_deploy_artifacts
 from .config import load_dotenv
 from .contracts import BootstrapResult, GeneratedWorkflow
 from .github import (
@@ -145,13 +146,38 @@ def add_cd_deploy_repo(
                     ),
                 )
 
-        # Provision the Harness pipeline INSIDE the deploy repo (env-parameterised),
-        # then have Harness watch the deploy repo.
-        try:
+        # Generate -> Validate loop (FR-N.10 / NFR-3): build the pipeline + the per-env
+        # values file and structurally validate them (sandbox only -- no real deploy).
+        # Retry up to cfg.max_attempts, then escalate to the exception list rather than
+        # raising a partial PR.
+        tag = latest_successful_ci_sha(owner, app, snapshot.default_branch, token) or ""
+        env_path = f"environments/{env}.yaml"
+        attempts = max(1, cfg.max_attempts)
+        problems: list[str] = []
+        pipeline_yaml = values_content = ""
+        for _attempt in range(attempts):
             pipeline_yaml = harness.build_pipeline_yaml(
                 snapshot, auto_deploy=auto_deploy, recipe=recipe, env=env, deploy_repo=deploy_repo,
                 delegate_selector=cfg.delegate_selector, approver_user_groups=list(cfg.approver_user_groups),
             )
+            values_content = _env_file_yaml(app, owner, env, tag, cfg.env_host_port(recipe.port, env), cfg.registry)
+            problems = validate_deploy_artifacts(pipeline_yaml, values_content, expect_approval=not auto_deploy)
+            if not problems:
+                break
+        else:
+            reason = "; ".join(problems)
+            ex_path = record_exception(cfg.exception_list_path, repo_url=repo_url, app=app, env=env, reason=reason)
+            return BootstrapResult(
+                repo_url=repo_url, status="error", kind="cd",
+                message=(
+                    f"CD generation failed validation after {attempts} attempt(s) — escalated to the "
+                    f"exception list ({ex_path}); no PR raised. Problems: {reason}"
+                ),
+            )
+
+        # Validated -> provision the Harness pipeline INSIDE the deploy repo, then have
+        # Harness watch the deploy repo.
+        try:
             pid = harness.store_pipeline_in_repo(
                 snapshot, token, auto_deploy=auto_deploy, branch=cfg.deploy_branch,
                 pipeline_yaml=pipeline_yaml, repo=deploy_repo,
@@ -195,12 +221,10 @@ def add_cd_deploy_repo(
         )
 
         # Open the tag-bump PR into the deploy repo (never merged -- merging deploys).
-        tag = latest_successful_ci_sha(owner, app, snapshot.default_branch, token) or ""
-        env_path = f"environments/{env}.yaml"
-        content = _env_file_yaml(app, owner, env, tag, cfg.env_host_port(recipe.port, env), cfg.registry)
+        # pipeline_yaml/values_content/tag/env_path were produced and validated above.
         try:
             pr_number, pr_url, branch = open_pr_in_repo(
-                owner, deploy_repo, [(env_path, content)], token,
+                owner, deploy_repo, [(env_path, values_content)], token,
                 base=cfg.deploy_branch,
                 branch_prefix=f"cicd-bootstrap/deploy-{env}",
                 title=f"deploy({app}): {env} → {tag[:7]}",

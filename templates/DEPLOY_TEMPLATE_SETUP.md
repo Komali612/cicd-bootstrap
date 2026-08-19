@@ -43,6 +43,8 @@ Nothing is hard-coded; each has a sensible default. Set in `.env` to swap a serv
 | `CD_DEPLOY_REPO_SUFFIX` | `-deploy` | naming of the per-app deploy repo |
 | `CD_DEPLOY_BRANCH` | `main` | default branch of the deploy repos |
 | `CD_GATE_DAST` / `CD_GATE_PLAYWRIGHT` | `off` | optional gates (Fortify/Playwright — not implemented yet) |
+| `CD_MAX_ATTEMPTS` | `3` | Generate→Validate retries before escalating to the exception list |
+| `CD_EXCEPTION_LIST` | `open-questions/cd-exceptions.md` | where validation failures are recorded for human review |
 
 ## 5. Phase 4 cut-over (flip the default — reversible)
 The default CD model is `in-repo` until the deploy-repo model is proven on a live run.
