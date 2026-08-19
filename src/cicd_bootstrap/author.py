@@ -99,8 +99,8 @@ def _render(snapshot: RepoSnapshot, classification: Classification) -> str:
         f"Repository: {snapshot.owner}/{snapshot.name}\n"
         f"Classified as: language={classification.language}, "
         f"build_system={classification.build_system}, test_command={classification.test_command!r}\n\n"
-        f"# File tree\n" + "\n".join(snapshot.tree) + "\n\n"
-        f"# Manifest files\n" + (manifests or "(none)")
+        "# File tree\n" + "\n".join(snapshot.tree) + "\n\n"
+        "# Manifest files\n" + (manifests or "(none)")
     )
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -338,3 +339,106 @@ def _git(cwd: Path, *args: str) -> str:
 
 def _redact(text: str, token: str) -> str:
     return text.replace(token, "***") if token else text
+
+
+# --- deploy-repo model: create per-app deploy repos + open tag-bump PRs -------
+# Used by the "deploy-repo" CD model (see cd_deploy_repo.py): the CD agent creates
+# a separate {app}-deploy repo from a template and opens a PR that bumps the image
+# tag in environments/<env>.yaml. It never merges the PR -- merging is the deploy
+# signal (Harness watches the deploy repo).
+
+def repo_exists(owner: str, name: str, token: str) -> bool:
+    """True if owner/name exists and the token can see it."""
+    resp = httpx.get(f"{API}/repos/{owner}/{name}", headers=_headers(token), timeout=30)
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 404:
+        return False
+    raise PROpenError(f"GitHub API {resp.status_code} checking {owner}/{name}: {resp.text[:300]}")
+
+
+def create_repo_from_template(
+    template_owner: str, template_repo: str, owner: str, name: str, token: str,
+    *, private: bool = True, description: str = "", wait_s: int = 20,
+) -> str:
+    """Create owner/name from the GitHub *template* repo template_owner/template_repo.
+
+    Returns the new repo's https URL. Idempotent: if owner/name already exists it is
+    returned unchanged. Requires a token that can create repositories.
+    """
+    if repo_exists(owner, name, token):
+        return f"https://github.com/{owner}/{name}.git"
+    body = {
+        "owner": owner, "name": name, "private": private,
+        "include_all_branches": False,
+        "description": description or f"Deploy config for {name.removesuffix('-deploy')}",
+    }
+    resp = httpx.post(
+        f"{API}/repos/{template_owner}/{template_repo}/generate",
+        headers=_headers(token), json=body, timeout=60,
+    )
+    if resp.status_code not in (201, 202):
+        # 422 can mean it already exists (race) -- tolerate that.
+        if resp.status_code == 422 and repo_exists(owner, name, token):
+            return f"https://github.com/{owner}/{name}.git"
+        raise PROpenError(
+            f"could not create {owner}/{name} from template "
+            f"{template_owner}/{template_repo} ({resp.status_code}): {resp.text[:300]}"
+        )
+    # The generated repo can take a moment to become cloneable.
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if repo_exists(owner, name, token):
+            break
+        time.sleep(2)
+    return f"https://github.com/{owner}/{name}.git"
+
+
+def open_pr_in_repo(
+    owner: str, name: str, files: list[tuple[str, str]], token: str,
+    *, base: str | None = None, branch_prefix: str, title: str, body: str,
+    commit_message: str,
+) -> tuple[int, str, str]:
+    """Clone owner/name, OVERWRITE `files` on a fresh branch, push, and open a PR.
+
+    Unlike :func:`open_pr_files` (which sidesteps clobbers and works in an
+    already-cloned app repo), this clones the target repo itself and overwrites the
+    given files -- used to bump the image tag in a deploy repo's
+    ``environments/<env>.yaml``. Returns (pr_number, pr_url, branch). Does NOT merge.
+    """
+    with tempfile.TemporaryDirectory(prefix="cicd-deploy-pr-") as tmp:
+        clone_dir = Path(tmp) / name
+        clone_url = f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
+        try:
+            _git(Path(tmp), "clone", "--depth", "1", clone_url, str(clone_dir))
+        except PROpenError as exc:
+            raise PROpenError(f"could not clone {owner}/{name}: {_redact(str(exc), token)}") from None
+        base = base or _git(clone_dir, "symbolic-ref", "--short", "HEAD").strip()
+        branch = f"{branch_prefix}-{int(time.time())}"
+        _git(clone_dir, "checkout", "-b", branch)
+        for path, content in files:
+            target = clone_dir / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+            _git(clone_dir, "add", str(target.relative_to(clone_dir)))
+        _git(
+            clone_dir, "-c", "user.name=cicd-bootstrap[bot]",
+            "-c", "user.email=cicd-bootstrap@users.noreply.github.com",
+            "commit", "-m", commit_message,
+        )
+        try:
+            _git(clone_dir, "push", clone_url, f"{branch}:{branch}")
+        except PROpenError as exc:
+            raise PROpenError(f"could not push to {owner}/{name}: {_redact(str(exc), token)}") from None
+        resp = httpx.post(
+            f"{API}/repos/{owner}/{name}/pulls",
+            headers=_headers(token),
+            json={"title": title, "head": branch, "base": base, "body": body},
+            timeout=30,
+        )
+        if resp.status_code >= 300:
+            raise PROpenError(
+                f"GitHub API {resp.status_code} opening PR in {owner}/{name}: {resp.text[:400]}"
+            )
+        data = resp.json()
+        return data["number"], data["html_url"], branch

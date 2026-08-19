@@ -29,7 +29,7 @@ from .github import (
     open_pr_files,
     resolve_token,
     set_repo_secret,
-    wait_for_ci_success,
+    wait_for_ci_success,  # re-exported: graph.py calls core.wait_for_ci_success (patched in tests)
 )
 from .ingest import IngestError, ingest, parse_repo_url
 from .sonar import provision_project
@@ -388,12 +388,35 @@ def add_cd_harness(
     auto_deploy: bool = True,
     open_pr_flag: bool = True,
     allow_llm_fallback: bool = False,
+    deploy_model: str | None = None,
+    env: str = "dev",
+    create_missing_repo: bool = False,
 ) -> BootstrapResult:
     """Set up CD-via-Harness for a repo. Requires HARNESS_* in .env (see .env.example).
 
     ``allow_llm_fallback`` lets the LLM work out the deploy port when the repo's
     Dockerfile has no ``EXPOSE`` (for unusual apps); otherwise it defaults to 8080.
+
+    ``deploy_model`` selects the CD model; when ``None`` it takes the configured default
+    (``CD_DEPLOY_MODEL``, shipped as ``in-repo``). Phase 4 cut-over = set
+    ``CD_DEPLOY_MODEL=deploy-repo`` once the deploy-repo model is live-proven (reversible).
+
+    * ``deploy-repo`` routes to the per-app deploy-repo (GitOps) model
+      (:func:`cd_deploy_repo.add_cd_deploy_repo`).
+    * ``in-repo`` stores the pipeline in the app repo (the body below, unchanged).
     """
+    if deploy_model is None:
+        from .cd_config import load_cd_config
+
+        deploy_model = load_cd_config().deploy_model
+    if deploy_model == "deploy-repo":
+        from .cd_deploy_repo import add_cd_deploy_repo
+
+        return add_cd_deploy_repo(
+            repo_url, env=env, token=token, auto_deploy=auto_deploy,
+            allow_llm_fallback=allow_llm_fallback, create_missing_repo=create_missing_repo,
+        )
+
     from . import harness  # local import: Harness is optional; only needed on this path
 
     load_dotenv()

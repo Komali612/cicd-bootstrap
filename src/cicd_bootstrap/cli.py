@@ -29,6 +29,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="alias for --agent cd (generate a CD/deploy workflow)")
     parser.add_argument("--auto-deploy", action="store_true",
                         help="(CD) deploy automatically to production instead of pausing for approval")
+    parser.add_argument("--deploy-model", choices=["in-repo", "deploy-repo"], default=None,
+                        help="(CD) CD model; defaults to CD_DEPLOY_MODEL (shipped 'in-repo'). "
+                             "'deploy-repo' uses a separate {app}-deploy repo (GitOps)")
+    parser.add_argument("--env", default="dev", help="(CD, deploy-repo) target environment (dev/staging/prod)")
+    parser.add_argument("--create-deploy-repo", action="store_true",
+                        help="(CD, deploy-repo) create the {app}-deploy repo from the template if it is missing")
     parser.add_argument("--manual-handoff", action="store_true",
                         help="(CD) run the deploy only when triggered by hand (no auto-run after CI)")
     parser.add_argument("--serve", action="store_true", help="run the chosen agent's web app instead")
@@ -70,8 +76,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if {ci.status, cd.status} <= {"opened", "generated"} else 1
 
     if gen_agent == "cd":
-        result = add_cd_harness(args.repo_url, open_pr_flag=not args.no_pr,
-                                auto_deploy=args.auto_deploy, allow_llm_fallback=args.llm_fallback)
+        result = add_cd_harness(args.repo_url, deploy_model=args.deploy_model, env=args.env,
+                                open_pr_flag=not args.no_pr, auto_deploy=args.auto_deploy,
+                                allow_llm_fallback=args.llm_fallback, create_missing_repo=args.create_deploy_repo)
     else:
         result = bootstrap(args.repo_url, open_pr_flag=not args.no_pr, allow_llm_fallback=args.llm_fallback)
 

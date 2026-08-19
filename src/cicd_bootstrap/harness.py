@@ -25,7 +25,6 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import time
 
 import httpx
 import yaml
@@ -129,7 +128,28 @@ def _health_block(recipe: DeployRecipe) -> str:
     )
 
 
-def build_deploy_script(owner: str, name: str, recipe: DeployRecipe) -> str:
+def _gitops_desired_state(owner: str, deploy_repo: str, *, read_port: bool) -> str:
+    """Shell that reads the desired state -- the image TAG, and (for a web service) the
+    host PORT -- from the deploy repo's environments/<env>.yaml, the source of truth,
+    instead of taking them as pipeline inputs. Reading the host port per env lets
+    dev/staging/prod publish distinct ports on the one delegate. GH_TOKEN is injected as
+    a masked secret env var by the deploy stage; the delegate needs curl + network
+    egress to api.github.com."""
+    port_read = ("""PORT="$(printf '%s\\n' "$DESIRED" | sed -n 's/^port:[[:space:]]*//p' | tr -d '"' | head -n1)"
+""" if read_port else "")
+    return f'''ENV="<+pipeline.variables.env>"
+DEPLOY_REPO="{owner}/{deploy_repo}"
+echo "Resolving desired state from $DEPLOY_REPO (environments/$ENV.yaml)"
+DESIRED="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$DEPLOY_REPO/contents/environments/$ENV.yaml")"
+IMG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^image:[[:space:]]*//p' | tr -d '"' | head -n1)"
+TAG="$(printf '%s\\n' "$DESIRED" | sed -n 's/^tag:[[:space:]]*//p' | tr -d '"' | head -n1)"
+ROLLBACK="$(printf '%s\\n' "$DESIRED" | sed -n 's/^rollback_image:[[:space:]]*//p' | tr -d '"' | head -n1)"
+{port_read}if [ -z "$TAG" ] || [ -z "$IMG" ]; then echo "Missing image/tag in environments/$ENV.yaml of $DEPLOY_REPO"; exit 1; fi
+echo "Desired image: $IMG:$TAG"
+'''
+
+
+def build_deploy_script(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False, deploy_repo: str | None = None) -> str:
     """The recreate-with-rollback deploy step the delegate runs (drives host Docker).
 
     Driven by a :class:`DeployRecipe`: a ``web-service`` publishes its port and is
@@ -138,27 +158,42 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe) -> str:
     from the recipe too. The image tag comes from the pipeline variable ``imageTag``.
     """
     image = f"ghcr.io/{owner.lower()}/{name.lower()}"
-    app = name.lower()
-    port = recipe.port
-
-    publish = f"-p {port}:{port} " if recipe.publish_port else ""
+    # In the deploy-repo (GitOps) model the container is env-scoped ({app}-{env}) so
+    # dev/staging/prod can run side by side on one delegate; env is a pipeline variable
+    # Harness resolves before the script runs. env_scoped=False keeps the original name.
+    app = f"{name.lower()}-<+pipeline.variables.env>" if env_scoped else name.lower()
+    container_port = recipe.port
     env_flags = "".join(f"-e {shlex.quote(f'{n}={v}')} " for n, v in recipe.env)
     cmd_suffix = "".join(f" {shlex.quote(c)}" for c in recipe.run_command)
-    run_new = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$IMAGE"{cmd_suffix}'
-    run_prev = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$PREV"{cmd_suffix}'
 
-    port_line = f'PORT="{port}"\n' if recipe.publish_port else ""
-    where = " on port $PORT" if recipe.publish_port else " (no published port)"
+    if deploy_repo:
+        # GitOps: the image ref, tag AND host port all come from environments/<env>.yaml,
+        # so the pipeline template is registry-agnostic and each env can publish its own
+        # host port on the one delegate. Only the host port ($PORT) varies per env.
+        tag_line = _gitops_desired_state(owner, deploy_repo, read_port=recipe.publish_port)
+        image_line = 'IMAGE="$IMG:$TAG"\n'  # $IMG (incl. registry) read from the values file
+        publish = f"-p $PORT:{container_port} " if recipe.publish_port else ""
+        port_line = ""  # PORT is set by the desired-state read above
+        where = " on host port $PORT" if recipe.publish_port else " (no published port)"
+    else:
+        # In-repo: tag is the pipeline's imageTag input; host == container port.
+        tag_line = 'TAG="<+pipeline.variables.imageTag>"\n'
+        image_line = f'IMAGE="{image}:$TAG"\n'
+        publish = f"-p {container_port}:{container_port} " if recipe.publish_port else ""
+        port_line = f'PORT="{container_port}"\n' if recipe.publish_port else ""
+        where = " on port $PORT" if recipe.publish_port else " (no published port)"
+
+    run_new = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$IMAGE"{cmd_suffix}'
+    run_prev = f'docker run -d --name "$APP" --restart unless-stopped {publish}{env_flags}"$ROLLBACK_TARGET"{cmd_suffix}'
     success = (
         "Deploy successful -- '$APP' is up and answering (HTTP $code)."
         if recipe.health_type == HEALTH_HTTP
         else "Deploy successful -- '$APP' is up and staying running."
     )
-
     return (
         "set +e\n"
-        'TAG="<+pipeline.variables.imageTag>"\n'
-        f'IMAGE="{image}:$TAG"\n'
+        f"{tag_line}"
+        f"{image_line}"
         f'APP="{app}"\n'
         f"{port_line}"
         f"echo \"Deploying $IMAGE  ->  container '$APP'{where}\"\n"
@@ -166,6 +201,9 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe) -> str:
         "# Remember the currently-running image so we can roll back to it if needed.\n"
         "PREV=\"$(docker inspect --format '{{.Config.Image}}' \"$APP\" 2>/dev/null || true)\"\n"
         'echo "Currently running image: ${PREV:-<none>}"\n'
+        "# Rollback target: an explicit rollback_image from the values file (if any),\n"
+        "# else the currently-running image (the last known-good build).\n"
+        'ROLLBACK_TARGET="${ROLLBACK:-$PREV}"\n'
         "\n"
         'if ! docker pull "$IMAGE"; then\n'
         '  echo "Could not pull $IMAGE -- leaving the current deployment untouched."\n'
@@ -184,19 +222,25 @@ def build_deploy_script(owner: str, name: str, recipe: DeployRecipe) -> str:
         "\n"
         'echo "New container failed its health check. Recent logs:"\n'
         'docker logs --tail 50 "$APP" 2>&1 || true\n'
-        'if [ -n "$PREV" ] && [ "$PREV" != "$IMAGE" ]; then\n'
-        '  echo "Rolling back to previous image: $PREV"\n'
+        'if [ -n "$ROLLBACK_TARGET" ] && [ "$ROLLBACK_TARGET" != "$IMAGE" ]; then\n'
+        '  echo "Rolling back to: $ROLLBACK_TARGET"\n'
+        '  docker pull "$ROLLBACK_TARGET" >/dev/null 2>&1 || true\n'
         '  docker rm -f "$APP" >/dev/null 2>&1 || true\n'
         f"  {run_prev}\n"
-        '  echo "Rolled back to $PREV."\n'
+        '  echo "Rolled back to $ROLLBACK_TARGET."\n'
         "else\n"
-        '  echo "No previous image to roll back to (first deploy?)."\n'
+        '  echo "No image to roll back to (first deploy?)."\n'
         "fi\n"
         "exit 1\n"
     )
 
 
-def _deploy_stage(owner: str, name: str, recipe: DeployRecipe) -> dict:
+def _deploy_stage(owner: str, name: str, recipe: DeployRecipe, *, env_scoped: bool = False,
+                  deploy_repo: str | None = None, delegate_selector: str = DELEGATE_SELECTOR) -> dict:
+    # GitOps: inject the GitHub token as a masked secret env var so the deploy script
+    # can read environments/<env>.yaml from the deploy repo.
+    env_vars = ([{"name": "GH_TOKEN", "type": "Secret", "value": identifier(TOKEN_SECRET_NAME)}]
+                if deploy_repo else [])
     return {
         "stage": {
             "name": "Deploy",
@@ -214,12 +258,12 @@ def _deploy_stage(owner: str, name: str, recipe: DeployRecipe) -> dict:
                                 "spec": {
                                     "shell": "Bash",
                                     "onDelegate": True,
-                                    "delegateSelectors": [DELEGATE_SELECTOR],
+                                    "delegateSelectors": [delegate_selector],
                                     "source": {
                                         "type": "Inline",
-                                        "spec": {"script": build_deploy_script(owner, name, recipe)},
+                                        "spec": {"script": build_deploy_script(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo)},
                                     },
-                                    "environmentVariables": [],
+                                    "environmentVariables": env_vars,
                                     "outputVariables": [],
                                 },
                             }
@@ -232,8 +276,9 @@ def _deploy_stage(owner: str, name: str, recipe: DeployRecipe) -> dict:
     }
 
 
-def _approval_stage() -> dict:
-    return {
+def _approval_stage(*, env_conditional: bool = False, approver_user_groups: list[str] | None = None) -> dict:
+    groups = approver_user_groups or ["_project_all_users"]
+    stage = {
         "stage": {
             "name": "Approval",
             "identifier": "Approval",
@@ -252,7 +297,7 @@ def _approval_stage() -> dict:
                                     "includePipelineExecutionHistory": True,
                                     "isAutoRejectEnabled": False,
                                     "approvers": {
-                                        "userGroups": ["_project_all_users"],
+                                        "userGroups": groups,
                                         "minimumCount": 1,
                                         "disallowPipelineExecutor": False,
                                     },
@@ -266,14 +311,55 @@ def _approval_stage() -> dict:
             "tags": {},
         }
     }
+    if env_conditional:
+        # dev auto-deploys on merge; staging/prod pause for a Harness approval.
+        stage["stage"]["when"] = {
+            "pipelineStatus": "Success",
+            "condition": '<+pipeline.variables.env> != "dev"',
+        }
+    return stage
 
 
-def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: bool, org: str, project: str) -> dict:
-    """The Harness pipeline dict: (optional approval ->) deploy on the laptop delegate."""
+def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: bool, org: str, project: str,
+                   env: str | None = None, deploy_repo: str | None = None,
+                   delegate_selector: str = DELEGATE_SELECTOR, approver_user_groups: list[str] | None = None) -> dict:
+    """The Harness pipeline dict: (optional approval ->) deploy on the laptop delegate.
+
+    Three shapes:
+
+    * ``env=None`` (default) -> the in-repo pipeline, byte-for-byte unchanged:
+      ``imageTag`` is the only input.
+    * ``deploy_repo`` set (the deploy-repo / GitOps model) -> the container is
+      env-scoped (``{app}-{env}``) and the image tag is read at run time from the
+      deploy repo's ``environments/<env>.yaml``, so only ``env`` is an input.
+    * ``env`` set without ``deploy_repo`` -> env-scoped container but the tag is still
+      an ``imageTag`` input (a stepping stone; not used by the agent)."""
+    env_scoped = env is not None
+    gitops = deploy_repo is not None
     stages: list[dict] = []
     if not auto_deploy:
-        stages.append(_approval_stage())
-    stages.append(_deploy_stage(owner, name, recipe))
+        # GitOps gates only non-dev environments (dev auto-deploys on merge); the in-repo
+        # model keeps its single unconditional approval.
+        stages.append(_approval_stage(env_conditional=gitops, approver_user_groups=approver_user_groups))
+    stages.append(_deploy_stage(owner, name, recipe, env_scoped=env_scoped, deploy_repo=deploy_repo,
+                                delegate_selector=delegate_selector))
+    if gitops:
+        # GitOps: the tag is read from environments/<env>.yaml at run time, so the only
+        # pipeline input is which environment to deploy.
+        variables: list[dict] = [
+            {"name": "env", "type": "String", "description": "target environment (dev/staging/prod)",
+             "required": True, "value": "<+input>"}
+        ]
+    else:
+        variables = [
+            {"name": "imageTag", "type": "String", "description": "GHCR image tag (the CI commit SHA)",
+             "required": True, "value": "<+input>"}
+        ]
+        if env_scoped:
+            variables.append(
+                {"name": "env", "type": "String", "description": "target environment (dev/staging/prod)",
+                 "required": True, "value": "<+input>"}
+            )
     return {
         "pipeline": {
             "name": f"Deploy {name}",
@@ -282,17 +368,16 @@ def build_pipeline(owner: str, name: str, recipe: DeployRecipe, *, auto_deploy: 
             "orgIdentifier": org,
             "tags": {},
             "stages": stages,
-            # imageTag is supplied at run time (by a person, or by the CI artifact trigger).
-            "variables": [
-                {"name": "imageTag", "type": "String", "description": "GHCR image tag (the CI commit SHA)",
-                 "required": True, "value": "<+input>"}
-            ],
+            "variables": variables,
         }
     }
 
 
 def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
-                        recipe: DeployRecipe | None = None, allow_llm_fallback: bool = False) -> str:
+                        recipe: DeployRecipe | None = None, allow_llm_fallback: bool = False,
+                        env: str | None = None, deploy_repo: str | None = None,
+                        delegate_selector: str = DELEGATE_SELECTOR,
+                        approver_user_groups: list[str] | None = None) -> str:
     cfg = HarnessConfig()
     if recipe is None:
         # Resolve the deploy recipe (built-in shape, or LLM-authored when none
@@ -302,7 +387,8 @@ def build_pipeline_yaml(snapshot: RepoSnapshot, *, auto_deploy: bool = True,
         recipe = resolve_recipe(snapshot, allow_llm_fallback=allow_llm_fallback)
     pipe = build_pipeline(
         snapshot.owner, snapshot.name, recipe,
-        auto_deploy=auto_deploy, org=cfg.org, project=cfg.project,
+        auto_deploy=auto_deploy, org=cfg.org, project=cfg.project, env=env, deploy_repo=deploy_repo,
+        delegate_selector=delegate_selector, approver_user_groups=approver_user_groups,
     )
     return yaml.dump(pipe, sort_keys=False, default_flow_style=False, width=4096)
 
@@ -318,84 +404,6 @@ def _raise_for(resp: httpx.Response, what: str) -> dict:
         msgs = body.get("responseMessages") or body.get("message") or body.get("raw")
         raise HarnessError(f"{what} failed ({resp.status_code}): {msgs}")
     return body
-
-
-def create_pipeline(pipeline_yaml: str, cfg: HarnessConfig | None = None) -> str:
-    """Create (or fail if exists) a pipeline from YAML. Returns its identifier."""
-    cfg = (cfg or HarnessConfig()).require()
-    resp = httpx.post(
-        f"{cfg.pipeline_base}/pipelines/v2",
-        params=cfg.scope, headers=cfg.headers(yaml_body=True),
-        content=pipeline_yaml, timeout=60,
-    )
-    body = _raise_for(resp, "create pipeline")
-    return (body.get("data") or {}).get("identifier", "")
-
-
-def update_pipeline(pipeline_id: str, pipeline_yaml: str, cfg: HarnessConfig | None = None) -> None:
-    """Update an existing pipeline's YAML (idempotent re-provisioning)."""
-    cfg = (cfg or HarnessConfig()).require()
-    resp = httpx.put(
-        f"{cfg.pipeline_base}/pipelines/v2/{pipeline_id}",
-        params=cfg.scope, headers=cfg.headers(yaml_body=True),
-        content=pipeline_yaml, timeout=60,
-    )
-    _raise_for(resp, "update pipeline")
-
-
-def upsert_pipeline(pipeline_yaml: str, pipeline_id: str, cfg: HarnessConfig | None = None) -> str:
-    """Create the pipeline, or update it if it already exists."""
-    cfg = (cfg or HarnessConfig()).require()
-    try:
-        return create_pipeline(pipeline_yaml, cfg)
-    except HarnessError:
-        update_pipeline(pipeline_id, pipeline_yaml, cfg)
-        return pipeline_id
-
-
-def execute_pipeline(pipeline_id: str, image_tag: str, cfg: HarnessConfig | None = None) -> str:
-    """Trigger a run, passing the image tag as the runtime input. Returns planExecutionId."""
-    cfg = (cfg or HarnessConfig()).require()
-    inputs = yaml.dump(
-        {"pipeline": {"identifier": pipeline_id,
-                      "variables": [{"name": "imageTag", "type": "String", "value": image_tag}]}},
-        sort_keys=False,
-    )
-    resp = httpx.post(
-        f"{cfg.pipeline_base}/pipeline/execute/{pipeline_id}",
-        params={**cfg.scope, "moduleType": "cd"},
-        headers=cfg.headers(yaml_body=True), content=inputs, timeout=60,
-    )
-    body = _raise_for(resp, "execute pipeline")
-    data = body.get("data") or {}
-    return data.get("planExecutionId") or (data.get("planExecution") or {}).get("uuid", "")
-
-
-def execution_status(plan_execution_id: str, cfg: HarnessConfig | None = None) -> str:
-    """Current status of a run: Running/Success/Failed/Aborted/etc."""
-    cfg = (cfg or HarnessConfig()).require()
-    resp = httpx.get(
-        f"{cfg.pipeline_base}/pipelines/execution/v2/{plan_execution_id}",
-        params=cfg.scope, headers=cfg.headers(), timeout=30,
-    )
-    body = _raise_for(resp, "execution status")
-    return ((body.get("data") or {}).get("pipelineExecutionSummary") or {}).get("status", "Unknown")
-
-
-def wait_for_execution(
-    plan_execution_id: str, cfg: HarnessConfig | None = None, *, timeout_s: int = 600, interval_s: int = 10
-) -> str:
-    """Poll until the run reaches a terminal status; return it."""
-    cfg = cfg or HarnessConfig()
-    terminal = {"Success", "Failed", "Aborted", "Errored", "Expired", "ApprovalRejected", "IgnoreFailed"}
-    deadline = time.monotonic() + timeout_s
-    status = "Unknown"
-    while time.monotonic() < deadline:
-        status = execution_status(plan_execution_id, cfg)
-        if status in terminal:
-            return status
-        time.sleep(interval_s)
-    return status
 
 
 # --- Git storage: secret + GitHub connector + remote (Git-stored) pipeline ----
@@ -486,20 +494,26 @@ def store_pipeline_in_repo(
     snapshot: RepoSnapshot, github_token: str, *,
     auto_deploy: bool = True, branch: str | None = None, cfg: HarnessConfig | None = None,
     allow_llm_fallback: bool = False, pipeline_yaml: str | None = None,
+    repo: str | None = None,
 ) -> str:
     """One call: ensure the token secret + GitHub connector, then create the deploy
     pipeline as a Git-stored file in the repo (Harness commits ``.harness/deploy.yaml``).
     Returns the pipeline identifier. Pass ``pipeline_yaml`` to reuse an already-built
-    pipeline (so the recipe is resolved once); otherwise it is built here."""
+    pipeline (so the recipe is resolved once); otherwise it is built here.
+
+    ``repo`` overrides where the pipeline is stored (defaults to the app repo,
+    ``snapshot.name``). The deploy-repo model passes the ``{app}-deploy`` repo so the
+    pipeline lives there instead of in the app repo."""
     cfg = (cfg or HarnessConfig()).require()
+    target_repo = repo or snapshot.name
     branch = branch or snapshot.default_branch
     token_ref = ensure_secret_text(TOKEN_SECRET_NAME, github_token, cfg)
-    connector = ensure_github_connector(snapshot.owner, cfg, token_ref=token_ref, validation_repo=snapshot.name)
+    connector = ensure_github_connector(snapshot.owner, cfg, token_ref=token_ref, validation_repo=target_repo)
     if pipeline_yaml is None:
         pipeline_yaml = build_pipeline_yaml(snapshot, auto_deploy=auto_deploy, allow_llm_fallback=allow_llm_fallback)
     pid = identifier(f"deploy_{snapshot.name}")
     return create_pipeline_remote(
-        pipeline_yaml, pid, connector_ref=connector, repo=snapshot.name, branch=branch, cfg=cfg,
+        pipeline_yaml, pid, connector_ref=connector, repo=target_repo, branch=branch, cfg=cfg,
     )
 
 
@@ -567,7 +581,12 @@ NOTIFY_WORKFLOW_PATH = ".github/workflows/notify-harness.yml"
 
 
 def render_notify_workflow(ci_workflow_name: str = "CI", branch: str = "main") -> str:
-    """A tiny workflow: on CI success, POST the built SHA to the Harness webhook."""
+    """A tiny workflow: on CI success, POST the built SHA to the Harness webhook.
+
+    IN-REPO CD ONLY (legacy). The deploy-repo model has Harness *watch the deploy repo*
+    instead, so this notify workflow + the per-pipeline webhook + the HARNESS_WEBHOOK_URL
+    secret are the in-repo-only bits slated for removal after the Phase 4 cut-over
+    (once CD_DEPLOY_MODEL=deploy-repo is live-proven). Kept until then."""
     return f"""\
 # Generated by cicd-bootstrap (Harness CD). Pings Harness to deploy the image CI
 # just pushed. The webhook URL is stored as the HARNESS_WEBHOOK_URL repo secret.
@@ -620,3 +639,68 @@ def deploy_via_harness(
                                  pipeline_yaml=pipeline_yaml)
     webhook_url = ensure_webhook_trigger(pid, cfg, branch=branch)
     return {"pipeline_id": pid, "webhook_url": webhook_url, "recipe": recipe, "pipeline_yaml": pipeline_yaml}
+
+
+# --- deploy-repo model: Harness watches the {app}-deploy repo ----------------
+# Instead of CI pinging a custom webhook, Harness itself watches the deploy repo: a
+# push to environments/** runs the pipeline. This is the "Harness watches the deploy
+# repo" choice -- no extra service to host.
+
+GITOPS_TRIGGER_PREFIX = "gitops"
+
+
+def ensure_git_trigger(
+    pipeline_id: str, connector_ref: str, repo: str, cfg: HarnessConfig | None = None, *,
+    branch: str = "main", path_glob: str | None = None, env: str = "dev",
+) -> str:
+    """Create (or update) a GitHub *push* trigger on ``repo`` that runs ``pipeline_id``
+    when ``environments/<env>.yaml`` changes. One trigger per env (so a change to a given
+    env's file deploys that env). Idempotent; returns the trigger id.
+
+    The pipeline reads the image tag from ``environments/<env>.yaml`` itself (the deploy
+    repo is the source of truth), so the trigger only needs to supply which ``env`` to
+    deploy."""
+    cfg = (cfg or HarnessConfig()).require()
+    path = path_glob or f"environments/{env}.yaml"
+    trigger_id = f"{GITOPS_TRIGGER_PREFIX}_{identifier(pipeline_id)}_{identifier(env)}"
+    input_yaml = yaml.dump(
+        {"pipeline": {"identifier": pipeline_id, "variables": [
+            {"name": "env", "type": "String", "value": env},
+        ]}},
+        sort_keys=False,
+    )
+    trig = {"trigger": {
+        "name": "GitOps deploy", "identifier": trigger_id, "enabled": True,
+        "orgIdentifier": cfg.org, "projectIdentifier": cfg.project,
+        "pipelineIdentifier": pipeline_id, "pipelineBranchName": branch,
+        "source": {"type": "Webhook", "spec": {"type": "Github", "spec": {
+            "type": "Push",
+            "spec": {
+                "connectorRef": connector_ref,
+                "repoName": repo,
+                "autoAbortPreviousExecutions": False,
+                "payloadConditions": [
+                    {"key": "targetBranch", "operator": "Equals", "value": branch},
+                    {"key": "changedFiles", "operator": "Contains", "value": path},
+                ],
+                "headerConditions": [],
+                "actions": [],
+            },
+        }}},
+        "inputYaml": input_yaml,
+    }}
+    body = yaml.dump(trig, sort_keys=False, default_flow_style=False, width=4096)
+    params = {**cfg.scope, "targetIdentifier": pipeline_id}
+    resp = httpx.post(f"{cfg.pipeline_base}/triggers", params=params,
+                      headers=cfg.headers(yaml_body=True), content=body, timeout=30)
+    try:
+        _raise_for(resp, "create git trigger")
+    except HarnessError as exc:
+        low = str(exc).lower()
+        if "already" in low or "duplicate" in low or "exist" in low:  # idempotent -> update
+            resp = httpx.put(f"{cfg.pipeline_base}/triggers/{trigger_id}", params=params,
+                             headers=cfg.headers(yaml_body=True), content=body, timeout=30)
+            _raise_for(resp, "update git trigger")
+        else:
+            raise
+    return trigger_id

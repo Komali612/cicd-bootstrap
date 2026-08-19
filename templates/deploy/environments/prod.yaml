@@ -1,0 +1,15 @@
+# Desired deploy state for this app in the `prod` environment.
+# The CD agent overwrites image/tag/port on deploy; merging a change here triggers Harness.
+app: APP_NAME
+env: prod
+image: ghcr.io/OWNER/APP_NAME
+tag: ""
+port: 8082
+
+# --- deployment config (FR-N.2), read from this file ---
+approvers: [_project_all_users]   # approver group(s) required for staging/prod
+rollback_image: ""            # explicit rollback target; empty = last running image
+notify: []                     # * notification team for failure/rollback
+change_request: ""            # * change-management request id (required for prod)
+cluster: ""                   # * target cluster (AKS)
+namespace: ""                 # * target namespace (AKS)
